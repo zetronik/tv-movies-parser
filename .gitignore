@@ -1,0 +1,9 @@
+.env
+movies.zip
+movies.db
+__pycache__/
+*.pyc
+*.log
+.idea
+.venv
+.git
