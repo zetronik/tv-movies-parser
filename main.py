@@ -19,8 +19,28 @@ logging.basicConfig(
     encoding='utf-8'
 )
 
+import os
+
+def update_progress(task_name, current, total):
+    try:
+        tmp_name = 'progress.tmp'
+        with open(tmp_name, 'w', encoding='utf-8') as f:
+            json.dump({'task': task_name, 'current': current, 'total': total, 'timestamp': time.time()}, f)
+        os.replace(tmp_name, 'progress.json')
+    except Exception as e:
+        print(f"Progress error: {e}")
+
+def get_config():
+    try:
+        with open('parser_config.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return {"run_tmdb": True, "run_rutracker": True, "cron_time": "02:00"}
+
 def main():
-    logging.info("--- Запуск парсера фильмов TMDB (Daily Export) ---")
+    config = get_config()
+    update_progress("Инициализация", 0, 100)
+    logging.info("--- Запуск парсера фильмов ---")
     
     # 1. Инициализация БД
     try:
@@ -30,99 +50,105 @@ def main():
         logging.error(f"Ошибка при инициализации БД: {e}")
         sys.exit(1)
 
-    # 2. Инициализация клиента TMDB
-    tmdb_client = TMDBClient()
-    
-    if not tmdb_client.read_token and not tmdb_client.api_key:
-        logging.error("Ошибка: API ключи TMDB не найдены в файле .env. Пожалуйста, заполните их.")
-        sys.exit(1)
-
-    logging.info("[2/3] Получение списков ID фильмов...")
-    try:
-        local_ids = db.get_existing_ids()
-        logging.info(f"ID в локальной базе: {len(local_ids)}")
+    # 2. Инициализация клиента TMDB (Если включено)
+    if config.get("run_tmdb", True):
+        tmdb_client = TMDBClient()
         
-        tmdb_ids = tmdb_client.download_daily_movie_ids()
-        logging.info(f"ID в базе TMDB (export): {len(tmdb_ids)}")
-        
-        ids_to_fetch = tmdb_ids - local_ids
-        logging.info(f"Новых ID для скачивания: {len(ids_to_fetch)}")
-    except Exception as e:
-        logging.error(f"Ошибка при получении списков ID: {e}")
-        sys.exit(1)
+        if not tmdb_client.read_token and not tmdb_client.api_key:
+            logging.error("Ошибка: API ключи TMDB не найдены в файле .env. Пожалуйста, заполните их.")
+            sys.exit(1)
 
-    # Обработка TMDB (ограничена 100 для скорости тестирования)
-    if ids_to_fetch:
-        limit = 100
-        ids_to_process = list(ids_to_fetch)[:limit]
-        logging.info(f"[3/3] Начинаем загрузку TMDB (взято {limit} ID для теста)...")
+        logging.info("[2/3] Получение списков ID фильмов...")
+        try:
+            local_ids = db.get_existing_ids()
+            logging.info(f"ID в локальной базе: {len(local_ids)}")
+            
+            tmdb_ids = tmdb_client.download_daily_movie_ids()
+            logging.info(f"ID в базе TMDB (export): {len(tmdb_ids)}")
+            
+            ids_to_fetch = tmdb_ids - local_ids
+            logging.info(f"Новых ID для скачивания: {len(ids_to_fetch)}")
+        except Exception as e:
+            logging.error(f"Ошибка при получении списков ID: {e}")
+            sys.exit(1)
 
-        saved_count = 0
-        for movie_id in tqdm(ids_to_process, desc="Парсинг TMDB", leave=True):
-            try:
-                movie = tmdb_client.get_movie_details(movie_id)
-                
-                title = movie.get("title")
-                original_title = movie.get("original_title")
-                overview = movie.get("overview")
-                rating = movie.get("vote_average")
-                release_date = movie.get("release_date")
-                poster_path = movie.get("poster_path")
-                
-                full_poster_url = tmdb_client.get_full_poster_url(poster_path)
-                
-                # Извлечение данных
-                genres = ", ".join([g.get("name", "") for g in movie.get("genres", []) if g.get("name")])
-                countries = ", ".join([c.get("name", "") for c in movie.get("production_countries", []) if c.get("name")])
-                
-                credits = movie.get("credits", {})
-                
-                # Режиссеры
-                directors = ", ".join([
-                    crew_member.get("name", "") 
-                    for crew_member in credits.get("crew", []) 
-                    if crew_member.get("job") == "Director" and crew_member.get("name")
-                ])
-                
-                # Актёры
-                actors = ", ".join([
-                    cast_member.get("name", "") 
-                    for cast_member in credits.get("cast", [])[:10] 
-                    if cast_member.get("name")
-                ])
-                
-                movie_data = (
-                    movie_id,
-                    title,
-                    original_title,
-                    overview,
-                    rating,
-                    release_date,
-                    full_poster_url,
-                    genres,
-                    countries,
-                    directors,
-                    actors
-                )
-                
-                db.upsert_movie(movie_data)
-                logging.info(f"Сохранен фильм ID {movie_id}: {title}")
-                saved_count += 1
-                
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 404:
-                    logging.info(f"ID {movie_id} не найден. Пропускаем.")
-                else:
-                    logging.error(f"HTTP ошибка для ID {movie_id}: {e}")
-            except Exception as e:
-                logging.error(f"Ошибка при обработке ID {movie_id}: {e}")
-                
-            time.sleep(0.05)
+        # Обработка TMDB (ограничена 100 для скорости тестирования)
+        if ids_to_fetch:
+            limit = 100
+            ids_to_process = list(ids_to_fetch)[:limit]
+            logging.info(f"[3/3] Начинаем загрузку TMDB (взято {limit} ID для теста)...")
+
+            saved_count = 0
+            total_tmdb = len(ids_to_process)
+            for i, movie_id in enumerate(tqdm(ids_to_process, desc="Парсинг TMDB", leave=True)):
+                update_progress("Парсинг TMDB", i, total_tmdb)
+                try:
+                    movie = tmdb_client.get_movie_details(movie_id)
+                    
+                    title = movie.get("title")
+                    original_title = movie.get("original_title")
+                    overview = movie.get("overview")
+                    rating = movie.get("vote_average")
+                    release_date = movie.get("release_date")
+                    poster_path = movie.get("poster_path")
+                    
+                    full_poster_url = tmdb_client.get_full_poster_url(poster_path)
+                    
+                    # Извлечение данных
+                    genres = ", ".join([g.get("name", "") for g in movie.get("genres", []) if g.get("name")])
+                    countries = ", ".join([c.get("name", "") for c in movie.get("production_countries", []) if c.get("name")])
+                    
+                    credits = movie.get("credits", {})
+                    
+                    # Режиссеры
+                    directors = ", ".join([
+                        crew_member.get("name", "") 
+                        for crew_member in credits.get("crew", []) 
+                        if crew_member.get("job") == "Director" and crew_member.get("name")
+                    ])
+                    
+                    # Актёры
+                    actors = ", ".join([
+                        cast_member.get("name", "") 
+                        for cast_member in credits.get("cast", [])[:10] 
+                        if cast_member.get("name")
+                    ])
+                    
+                    movie_data = (
+                        movie_id,
+                        title,
+                        original_title,
+                        overview,
+                        rating,
+                        release_date,
+                        full_poster_url,
+                        genres,
+                        countries,
+                        directors,
+                        actors
+                    )
+                    
+                    db.upsert_movie(movie_data)
+                    logging.info(f"Сохранен фильм ID {movie_id}: {title}")
+                    saved_count += 1
+                    
+                except requests.exceptions.HTTPError as e:
+                    if e.response.status_code == 404:
+                        logging.info(f"ID {movie_id} не найден. Пропускаем.")
+                    else:
+                        logging.error(f"HTTP ошибка для ID {movie_id}: {e}")
+                except Exception as e:
+                    logging.error(f"Ошибка при обработке ID {movie_id}: {e}")
+                    
+                time.sleep(0.05)
+        else:
+            logging.info("База фильмов TMDB актуальна.")
     else:
-        logging.info("База фильмов TMDB актуальна.")
+        logging.info("Парсинг TMDB отключен в настройках.")
 
-    # 3. Полный прогон парсера Рутрекера
-    logging.info("--- Запуск парсера Rutracker ---")
+    # 3. Полный прогон парсера Рутрекера (Если включено)
+    if config.get("run_rutracker", True):
+        logging.info("--- Запуск парсера Rutracker ---")
     rutracker_client = RutrackerClient()
     
     logging.info("Авторизация на Rutracker...")
@@ -143,7 +169,9 @@ def main():
 
     logging.info(f"Фильмов для парсинга раздач: {len(movies)}")
 
-    for movie in tqdm(movies, desc="Парсинг Rutracker", leave=True):
+    total_rutracker = len(movies)
+    for i, movie in enumerate(tqdm(movies, desc="Парсинг Rutracker", leave=True)):
+        update_progress("Парсинг Rutracker", i, total_rutracker)
         movie_id, title, original_title, release_date = movie
         year = release_date[:4] if release_date else ""
         
@@ -195,8 +223,11 @@ def main():
             
         except Exception as e:
              logging.error(f"Ошибка при парсинге раздач для фильма {title}: {e}")
+    else:
+        logging.info("Парсинг Rutracker отключен в настройках.")
 
     # 4. Архивация базы данных
+    update_progress("Сжатие базы данных", 99, 100)
     logging.info("Сжатие базы данных...")
     try:
         with zipfile.ZipFile("movies.zip", "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -206,6 +237,7 @@ def main():
         logging.error(f"Ошибка при сжатии базы данных: {e}")
 
     logging.info("--- Работа скрипта завершена ---")
+    update_progress("Ожидание", 0, 0)
 
 if __name__ == "__main__":
     main()

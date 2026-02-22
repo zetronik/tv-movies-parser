@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2 class="mb-4">Dashboard Overview</h2>
+
+<div class="row g-4">
+    <div class="col-md-4">
+        <div class="card shadow-sm h-100">
+            <div class="card-body text-center">
+                <h5 class="card-title text-muted">Total Movies</h5>
+                <h1 class="display-4 text-primary" id="moviesCount">{{ movies_count }}</h1>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card shadow-sm h-100">
+            <div class="card-body text-center">
+                <h5 class="card-title text-muted">Total Torrents</h5>
+                <h1 class="display-4 text-success" id="torrentsCount">{{ torrents_count }}</h1>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card shadow-sm h-100">
+            <div class="card-body text-center">
+                <h5 class="card-title text-muted">Movies w/o Torrents</h5>
+                <h1 class="display-4 text-warning" id="noTorrentsCount">{{ movies_without_torrents }}</h1>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="mt-4 mb-4">
+    <a href="/movies" class="btn btn-outline-light btn-lg">Browse Movies Directory &rarr;</a>
+</div>
+
+<div class="row mt-4">
+    <div class="col-md-4">
+        <div class="card shadow-sm h-100">
+            <div class="card-header bg-dark border-secondary">
+                <i class="bi bi-sliders"></i> Parser Settings
+            </div>
+            <div class="card-body">
+                <form id="configForm">
+                    <div class="mb-3">
+                        <label class="form-label text-muted">Cron Time (Daily)</label>
+                        <input type="time" class="form-control bg-dark text-light border-secondary" id="cronTime" value="02:00">
+                    </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="runTmdb">
+                        <label class="form-check-label" for="runTmdb">Update TMDB catalog</label>
+                    </div>
+                    <div class="form-check form-switch mb-4">
+                        <input class="form-check-input" type="checkbox" id="runRutracker">
+                        <label class="form-check-label" for="runRutracker">Parse Rutracker Torrents</label>
+                    </div>
+                    <button type="button" class="btn btn-primary w-100 mb-2" onclick="saveConfig()">Save Settings</button>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-8">
+        <div class="card shadow-sm h-100">
+            <div class="card-header bg-dark border-secondary d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-terminal"></i> Parser Terminal</span>
+                <div>
+                    <button id="btnStart" class="btn btn-sm btn-success me-2" onclick="parserAction('start')">▶ Start</button>
+                    <button id="btnStop" class="btn btn-sm btn-danger me-2" onclick="parserAction('stop')" disabled>■ Stop</button>
+                    <span id="taskStatusBadge" class="badge bg-secondary">Idle</span>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="d-flex justify-content-between mb-2">
+                    <h5 id="taskName">No active task</h5>
+                    <span id="taskProgressText" class="text-muted">0 / 0</span>
+                </div>
+                <div class="progress mb-3 bg-dark border border-secondary" style="height: 25px;">
+                    <div id="taskProgressBar" class="progress-bar progress-bar-striped progress-bar-animated bg-primary" role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">0%</div>
+                </div>
+                
+                <div class="bg-black p-3 rounded text-light font-monospace border border-secondary" style="height: 350px; overflow-y: scroll; font-size: 0.85rem;" id="logWindow">
+                    <div class="text-muted">Waiting for logs...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Load config on page load
+    fetch('/api/config')
+        .then(res => res.json())
+        .then(data => {
+            document.getElementById('cronTime').value = data.cron_time || '02:00';
+            document.getElementById('runTmdb').checked = data.run_tmdb;
+            document.getElementById('runRutracker').checked = data.run_rutracker;
+        });
+
+    function saveConfig() {
+        const payload = {
+            cron_time: document.getElementById('cronTime').value,
+            run_tmdb: document.getElementById('runTmdb').checked,
+            run_rutracker: document.getElementById('runRutracker').checked
+        };
+        fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        }).then(() => alert('Settings saved and cron updated!'));
+    }
+
+    function parserAction(actionType) {
+        if (actionType === 'start') {
+            const payload = {
+                cron_time: document.getElementById('cronTime').value,
+                run_tmdb: document.getElementById('runTmdb').checked,
+                run_rutracker: document.getElementById('runRutracker').checked
+            };
+            // Сначала сохраняем конфиг, затем запускаем
+            fetch('/api/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            }).then(() => {
+                fetch('/api/action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({action: actionType})
+                });
+            });
+        } else {
+            fetch('/api/action', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: actionType})
+            });
+        }
+    }
+
+    function updateStatus() {
+        fetch('/api/status')
+            .then(res => res.json())
+            .then(data => {
+                const logWindow = document.getElementById('logWindow');
+                const progressBar = document.getElementById('taskProgressBar');
+                const taskName = document.getElementById('taskName');
+                const taskProgressText = document.getElementById('taskProgressText');
+                const badge = document.getElementById('taskStatusBadge');
+
+                // Плавная прокрутка, если мы находились в самом низу
+                const isScrolledToBottom = logWindow.scrollHeight - logWindow.clientHeight <= logWindow.scrollTop + 50;
+                
+                // Обновляем логи
+                if (data.logs && data.logs.length > 0) {
+                    logWindow.innerHTML = data.logs.map(log => {
+                        let color = 'text-light';
+                        if (log.includes(' - INFO - ')) color = 'text-info';
+                        if (log.includes(' - ERROR - ')) color = 'text-danger';
+                        if (log.includes(' - WARNING - ')) color = 'text-warning';
+                        return '<div class="' + color + '">' + log + '</div>';
+                    }).join('');
+                } else {
+                    logWindow.innerHTML = '<div class="text-muted">Log file is empty or not found.</div>';
+                }
+                
+                if (isScrolledToBottom) {
+                    logWindow.scrollTop = logWindow.scrollHeight;
+                }
+
+                // Обновляем прогресс-бар
+                let task = data.task || 'Idle';
+                let current = data.current || 0;
+                let total = data.total || 0;
+                let isRunning = data.is_running || false;
+                
+                // Кнопки управления
+                document.getElementById('btnStart').disabled = isRunning;
+                document.getElementById('btnStop').disabled = !isRunning;
+                
+                // Обновляем статистику, если она пришла
+                if (data.movies_count !== undefined) {
+                    document.getElementById('moviesCount').textContent = data.movies_count;
+                }
+                if (data.torrents_count !== undefined) {
+                    document.getElementById('torrentsCount').textContent = data.torrents_count;
+                }
+                if (data.movies_without_torrents !== undefined) {
+                    document.getElementById('noTorrentsCount').textContent = data.movies_without_torrents;
+                }
+                
+                taskName.textContent = task;
+                
+                if (task === 'Idle' || total === 0) {
+                    badge.className = 'badge bg-secondary';
+                    badge.textContent = 'Idle';
+                    progressBar.style.width = '0%';
+                    progressBar.textContent = '0%';
+                    taskProgressText.textContent = '';
+                } else {
+                    badge.className = 'badge bg-success';
+                    badge.textContent = 'Running';
+                    let percent = Math.round((current / total) * 100);
+                    progressBar.style.width = percent + '%';
+                    progressBar.textContent = percent + '%';
+                    taskProgressText.textContent = current + ' / ' + total;
+                }
+            })
+            .catch(err => console.error('Error fetching status:', err));
+    }
+    
+    // Запускаем опрос каждые 1.5 секунды
+    setInterval(updateStatus, 1500);
+    updateStatus();
+</script>
+{% endblock %}

@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="mb-3">
+    <a href="javascript:history.back()" class="text-decoration-none text-muted">&larr; Back</a>
+</div>
+
+<div class="row mb-5">
+    <div class="col-md-3">
+        {% if movie.poster_url %}
+        <img src="{{ movie.poster_url }}" alt="{{ movie.title }}" class="img-fluid rounded shadow w-100">
+        {% else %}
+        <div class="bg-secondary rounded shadow w-100 d-flex align-items-center justify-content-center text-white" style="height: 400px;">No Poster</div>
+        {% endif %}
+    </div>
+    
+    <div class="col-md-9">
+        <div class="d-flex justify-content-between align-items-start">
+            <div>
+                <h1 class="mb-1">{{ movie.title }}</h1>
+                <h4 class="text-muted mb-3">{{ movie.original_title }} ({{ movie.release_date[:4] if movie.release_date else 'N/A' }})</h4>
+            </div>
+            <span class="badge bg-primary fs-5 border border-light">★ {{ movie.rating }}</span>
+        </div>
+        
+        <p class="lead mt-3">{{ movie.overview }}</p>
+        
+        <div class="row mt-4">
+            <div class="col-sm-6">
+                <p><strong>Genres:</strong> {{ movie.genres or 'N/A' }}</p>
+                <p><strong>Countries:</strong> {{ movie.countries or 'N/A' }}</p>
+                <p><strong>Release Date:</strong> {{ movie.release_date or 'N/A' }}</p>
+            </div>
+            <div class="col-sm-6">
+                <p><strong>Directors:</strong> {{ movie.directors or 'N/A' }}</p>
+                <p><strong>Cast:</strong> {{ movie.actors or 'N/A' }}</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<h3 class="mb-3 border-bottom border-secondary pb-2">Available Torrents <span class="badge bg-secondary ms-2">{{ torrents|length }}</span></h3>
+
+{% if torrents %}
+<div class="card shadow-sm">
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-striped table-hover mb-0 align-middle">
+                <thead>
+                    <tr>
+                        <th class="ps-4">Topic Title</th>
+                        <th>Quality</th>
+                        <th>Format</th>
+                        <th>Size (GB)</th>
+                        <th>Se/Le</th>
+                        <th class="text-end pe-4">Magnet</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for torrent in torrents %}
+                    <tr>
+                        <td class="ps-4" style="max-width: 300px;">
+                            <div class="text-truncate" title="{{ torrent.topic_title }}">
+                                {{ torrent.topic_title }}
+                            </div>
+                            <small class="text-muted">{{ torrent.translation or 'Original' }}</small>
+                        </td>
+                        <td><span class="badge bg-info text-dark">{{ torrent.quality or 'Unknown' }}</span></td>
+                        <td>{{ torrent.file_format or 'N/A' }}</td>
+                        <td><strong>{{ torrent.size_gb }}</strong></td>
+                        <td>
+                            <span class="text-success" title="Seeds">↑{{ torrent.seeds or 0 }}</span> / 
+                            <span class="text-danger" title="Leeches">↓{{ torrent.leeches or 0 }}</span>
+                        </td>
+                        <td class="text-end pe-4">
+                            {% if torrent.magnet_link %}
+                            <a href="{{ torrent.magnet_link }}" class="btn btn-sm btn-outline-success">🧲 Magnet</a>
+                            {% else %}
+                            <span class="text-muted">N/A</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% else %}
+<div class="alert alert-dark border-secondary" role="alert">
+  No torrents found for this movie yet.
+</div>
+{% endif %}
+{% endblock %}
