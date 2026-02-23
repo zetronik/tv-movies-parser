@@ -1,1 +1,1 @@
-{"cron_time": "02:00", "run_tmdb": false, "run_rutracker": true}
+{"cron_time": "02:00", "run_tmdb": true, "run_rutracker": false}
