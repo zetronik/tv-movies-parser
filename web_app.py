@@ -27,11 +27,14 @@ def save_parser_config(data):
     with open('parser_config.json', 'w', encoding='utf-8') as f:
         json.dump(data, f)
         
-def start_parser_task():
+def start_parser_task(mode):
     global parser_process
     if parser_process is None or parser_process.poll() is not None:
+        if os.path.exists('stop.flag'):
+            try: os.remove('stop.flag')
+            except OSError: pass
         # Процесс не запущен или уже завершился
-        parser_process = subprocess.Popen(["python", "main.py"])
+        parser_process = subprocess.Popen(["python", "main.py", "--mode", mode])
 
 def update_cron_job(cron_time_str):
     try:
@@ -43,7 +46,7 @@ def update_cron_job(cron_time_str):
 # Добавляем задачу при старте
 initial_config = get_parser_config()
 h, m = map(int, initial_config.get("cron_time", "02:00").split(':'))
-scheduler.add_job(id='parser_job', func=start_parser_task, trigger=CronTrigger(hour=h, minute=m))
+scheduler.add_job(id='parser_job', func=start_parser_task, args=['cron'], trigger=CronTrigger(hour=h, minute=m))
 
 def make_searchable(text):
     if not text:
@@ -151,7 +154,8 @@ def api_status():
     global parser_process
     
     is_running = parser_process is not None and parser_process.poll() is None
-    status = {'task': 'Idle', 'current': 0, 'total': 0, 'logs': [], 'is_running': is_running}
+    is_stopping = os.path.exists('stop.flag')
+    status = {'task': 'Idle', 'current': 0, 'total': 0, 'logs': [], 'is_running': is_running, 'is_stopping': is_stopping}
     
     # Считывание статистики БД
     try:
@@ -202,18 +206,17 @@ def api_action():
     global parser_process
     action = request.json.get('action')
     
-    if action == 'start':
-        start_parser_task()
+    if action == 'start_tmdb':
+        start_parser_task('tmdb')
+        return jsonify({"status": "started"})
+    elif action == 'start_rutracker':
+        start_parser_task('rutracker')
         return jsonify({"status": "started"})
     elif action == 'stop':
         if parser_process is not None and parser_process.poll() is None:
-            parser_process.terminate()
-            # Очищаем статус прогресса
-            try:
-                with open('progress.json', 'w', encoding='utf-8') as f:
-                    json.dump({'task': 'Stopped', 'current': 0, 'total': 0}, f)
-            except: pass
-            return jsonify({"status": "stopped"})
+            with open('stop.flag', 'w') as f:
+                f.write('stop')
+            return jsonify({"status": "stopping"})
         return jsonify({"status": "not_running"})
     return abort(400)
 

@@ -115,47 +115,101 @@ class RutrackerClient:
         clean_value = value.strip(' :\\n\\r\\t\\xa0')
         return clean_value if clean_value else None
 
-    def get_topic_details(self, topic_url):
-        """Получает детальную информацию со страницы раздачи"""
-        response = self.session.get(topic_url)
+    def get_forums_from_category(self, category_id):
+        """Собирает ID всех подразделов (форумов) из указанной категории (например, Кино = 2)."""
+        url = f"https://rutracker.org/forum/index.php?c={category_id}"
+        response = self.session.get(url)
         response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'lxml')
         
-        soup = BeautifulSoup(response.text, "lxml")
+        forum_ids = []
+        # Ищем все ссылки на форумы (подразделы)
+        for a_tag in soup.select('a'):
+            href = a_tag.get('href')
+            if href and 'viewforum.php?f=' in href:
+                forum_id = href.split('f=')[-1]
+                forum_ids.append(forum_id)
+        return list(set(forum_ids)) # Убираем дубликаты
+
+    def get_topic_details(self, topic_id):
+        """Заходит в топик и собирает магнит, сиды, личи и размер."""
+        url = f"https://rutracker.org/forum/viewtopic.php?t={topic_id}"
+        response = self.session.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'lxml')
         
         details = {
-            'magnet': None,
-            'size': None,
-            'quality': None,
-            'format': None,
-            'translation': None
+            'magnet': None, 'size_gb': 0.0, 'seeds': 0, 'leeches': 0,
+            'quality': None, 'format': None, 'translation': None
         }
-
-        # Magnet ссылка
-        magnet_a = soup.find("a", class_="magnet-link")
-        if magnet_a and magnet_a.has_attr('href'):
-             details['magnet'] = magnet_a['href']
         
-        # Размер
+        # Магнет ссылка
+        magnet_a = soup.find("a", class_="magnet-link")
+        if magnet_a: details['magnet'] = magnet_a.get('href')
+        
+        # Сиды и Личи (на рутрекере хранятся в span с классами seed и leech)
+        seed_span = soup.find("span", class_="seed")
+        if seed_span: details['seeds'] = int(re.sub(r'[^0-9]', '', seed_span.text) or 0)
+        
+        leech_span = soup.find("span", class_="leech")
+        if leech_span: details['leeches'] = int(re.sub(r'[^0-9]', '', leech_span.text) or 0)
+            
+        # Размер файла
         size_span = soup.find("span", id="tor-size-humn")
         if size_span:
-            raw_size = size_span.text
-            # Очистка неразрывных пробелов
-            clean_size = raw_size.replace('\xa0', ' ').replace('&nbsp;', ' ').strip()
-            details['size'] = clean_size
-
-        # Детальная информация с синонимами
-        details['quality'] = self._extract_meta(soup, ["Качество", "Тип релиза", "Релиз"])
-        
-        # Запасной план для извлечения качества из заголовка
-        if not details['quality']:
-            title_tag = soup.select_one('h1.maintitle a')
-            if title_tag:
-                # Ищем последний элемент внутри квадратных скобок (например, [1988, комедия, BDRemux 1080p])
-                match = re.search(r'\[[^\]]+,\s*([^,\]]+)\]', title_tag.text)
-                if match:
-                    details['quality'] = match.group(1).strip()
-                    
-        details['format'] = self._extract_meta(soup, ["Формат", "Контейнер", "Расширение"])
-        details['translation'] = self._extract_meta(soup, ["Перевод", "Озвучивание", "Озвучка"])
-
+            raw_size = size_span.text.replace('\xa0', ' ').replace('&nbsp;', ' ').strip()
+            match = re.search(r'([\d\.]+)\s*([A-Za-zА-Яа-я]+)', raw_size)
+            if match:
+                val = float(match.group(1))
+                unit = match.group(2).upper()
+                if unit in ['GB', 'ГБ']: details['size_gb'] = val
+                elif unit in ['MB', 'МБ']: details['size_gb'] = val / 1024.0
+                
+        # Качество берем из заголовка как резерв (последнее значение в скобках [])
+        title_tag = soup.select_one('h1.maintitle a')
+        if title_tag:
+            q_match = re.search(r'\[[^\]]+,\s*([^,\]]+)\]', title_tag.text)
+            if q_match: details['quality'] = q_match.group(1).strip()
+            
         return details
+
+    def parse_topic_title(self, title):
+        """
+        Извлекает русское название, оригинальное название и год из стандартного заголовка Rutracker.
+        Пример: Зеленая миля / The Green Mile (Фрэнк Дарабонт) [1999, США, BDRip]
+        """
+        # Регулярное выражение для поиска названий и года в квадратных скобках
+        match = re.search(r'^(.+?)(?:\s+/\s+(.+?))?(?:\s+\(.*\))?\s+\[(\d{4})', title)
+        if match:
+            ru_title = match.group(1).strip()
+            # Если оригинального названия нет, group(2) будет None
+            orig_title = match.group(2).strip() if match.group(2) else ""
+            year = match.group(3)
+            return ru_title, orig_title, year
+        return None, None, None
+
+    def get_topics_from_forum(self, forum_id, pages=1):
+        """
+        Проходит по страницам форума и собирает ссылки на топики и их заголовки.
+        """
+        topics = []
+        for page in range(pages):
+            # Рутрекер использует смещение (start) кратное 50 для пагинации
+            start = page * 50
+            url = f"https://rutracker.org/forum/viewforum.php?f={forum_id}&start={start}"
+            
+            response = self.session.get(url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'lxml')
+            
+            # Ищем все ссылки на топики в таблице
+            for a_tag in soup.select('a.tt-text'):
+                title = a_tag.text.strip()
+                href = a_tag.get('href')
+                if href and 'viewtopic.php?t=' in href:
+                    topic_id = href.split('t=')[-1]
+                    topics.append({
+                        'topic_id': topic_id,
+                        'title': title
+                    })
+        return topics

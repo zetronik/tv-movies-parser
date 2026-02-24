@@ -106,3 +106,34 @@ class MovieDatabase:
         with self.get_connection() as conn:
             conn.execute(query, (movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches))
             conn.commit()
+
+    def find_movie_by_title_and_year(self, title, original_title, year):
+        """
+        Ищет фильм в базе по названию и году.
+        Возвращает ID фильма или None.
+        """
+        if not year:
+            return None
+            
+        query = """
+        SELECT id FROM movies 
+        WHERE (title LIKE ? OR original_title LIKE ?) 
+        AND release_date LIKE ? 
+        LIMIT 1
+        """
+        # Ищем год в начале release_date (формат YYYY-MM-DD)
+        year_pattern = f"{year}-%"
+        
+        with self.get_connection() as conn:
+            # Пробуем найти по оригинальному названию, если оно есть
+            if original_title:
+                cursor = conn.execute(query, (f"%{original_title}%", f"%{original_title}%", year_pattern))
+                result = cursor.fetchone()
+                if result: return result[0]
+                
+            # Пробуем найти по русскому названию
+            cursor = conn.execute(query, (f"%{title}%", f"%{title}%", year_pattern))
+            result = cursor.fetchone()
+            if result: return result[0]
+            
+        return None

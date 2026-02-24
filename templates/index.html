@@ -67,7 +67,8 @@
             <div class="card-header bg-dark border-secondary d-flex justify-content-between align-items-center">
                 <span><i class="bi bi-terminal"></i> Parser Terminal</span>
                 <div>
-                    <button id="btnStart" class="btn btn-sm btn-success me-2" onclick="parserAction('start')">▶ Start</button>
+                    <button id="btnStartTmdb" class="btn btn-sm btn-info me-2" onclick="parserAction('start_tmdb')">▶ Update TMDB</button>
+                    <button id="btnStartRutracker" class="btn btn-sm btn-primary me-2" onclick="parserAction('start_rutracker')">▶ Parse Torrents</button>
                     <button id="btnStop" class="btn btn-sm btn-danger me-2" onclick="parserAction('stop')" disabled>■ Stop</button>
                     <span id="taskStatusBadge" class="badge bg-secondary">Idle</span>
                 </div>
@@ -113,7 +114,7 @@
     }
 
     function parserAction(actionType) {
-        if (actionType === 'start') {
+        if (actionType === 'start_tmdb' || actionType === 'start_rutracker') {
             const payload = {
                 cron_time: document.getElementById('cronTime').value,
                 run_tmdb: document.getElementById('runTmdb').checked,
@@ -175,10 +176,12 @@
                 let current = data.current || 0;
                 let total = data.total || 0;
                 let isRunning = data.is_running || false;
+                let isStopping = data.is_stopping || false;
                 
                 // Кнопки управления
-                document.getElementById('btnStart').disabled = isRunning;
-                document.getElementById('btnStop').disabled = !isRunning;
+                document.getElementById('btnStartTmdb').disabled = isRunning || isStopping;
+                document.getElementById('btnStartRutracker').disabled = isRunning || isStopping;
+                document.getElementById('btnStop').disabled = !isRunning || isStopping;
                 
                 // Обновляем статистику, если она пришла
                 if (data.movies_count !== undefined) {
@@ -193,7 +196,14 @@
                 
                 taskName.textContent = task;
                 
-                if (task === 'Idle' || total === 0) {
+                if (isStopping) {
+                    badge.className = 'badge bg-warning text-dark';
+                    badge.textContent = 'Останавливается... Сохранение БД';
+                    let percent = total > 0 ? Math.round((current / total) * 100) : 0;
+                    progressBar.style.width = percent + '%';
+                    progressBar.textContent = percent + '%';
+                    taskProgressText.textContent = current + ' / ' + total;
+                } else if (task === 'Idle' || total === 0) {
                     badge.className = 'badge bg-secondary';
                     badge.textContent = 'Idle';
                     progressBar.style.width = '0%';
