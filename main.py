@@ -39,10 +39,20 @@ def get_config():
 
 def create_zip(db_name="movies.db"):
     update_progress("Сжатие базы данных", 99, 100)
-    logging.info("Сжатие базы данных (создание movies.zip)...")
+    logging.info("Сжатие базы данных...")
     try:
-        with zipfile.ZipFile("movies.zip", "w", zipfile.ZIP_DEFLATED) as zipf:
+        temp_zip = "movies_temp.zip"
+        with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
             zipf.write(db_name)
+        
+        # Безопасная замена файла (с попытками, если файл сейчас скачивают)
+        for _ in range(5):
+            try:
+                os.replace(temp_zip, "movies.zip")
+                break
+            except PermissionError:
+                time.sleep(2)
+                
         logging.info("База данных успешно сжата в movies.zip")
     except Exception as e:
         logging.error(f"Ошибка при сжатии базы данных: {e}")

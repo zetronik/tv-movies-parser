@@ -221,4 +221,6 @@ def api_action():
     return abort(400)
 
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False)
+    from waitress import serve
+    print("Запуск production-сервера Waitress на порту 5000...")
+    serve(app, host='0.0.0.0', port=5000, threads=4)
