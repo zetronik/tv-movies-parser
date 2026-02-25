@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  parser:
+    build: .
+    container_name: tv-movies-parser-prod
+    restart: always # Контейнер будет сам подниматься после перезагрузки сервера
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env.prod # Используем боевые ключи
+    volumes:
+      # Пробрасываем только базу данных, архивы и конфиги (чтобы они выживали при обновлении)
+      - parser_data:/app/data
+
+volumes:
+  parser_data: # Именованный "сейф" Докера для хранения данных

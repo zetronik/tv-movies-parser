@@ -9,7 +9,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 app = Flask(__name__)
-DB_NAME = "movies.db"
+DATA_DIR = 'data/'
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_NAME = os.path.join(DATA_DIR, "movies.db")
 
 # Глобальное состояние для процесса
 parser_process = None
@@ -18,20 +20,21 @@ scheduler.start()
 
 def get_parser_config():
     try:
-        with open('parser_config.json', 'r', encoding='utf-8') as f:
+        with open(os.path.join(DATA_DIR, 'parser_config.json'), 'r', encoding='utf-8') as f:
             return json.load(f)
     except:
         return {"run_tmdb": True, "run_rutracker": True, "cron_time": "02:00"}
 
 def save_parser_config(data):
-    with open('parser_config.json', 'w', encoding='utf-8') as f:
+    with open(os.path.join(DATA_DIR, 'parser_config.json'), 'w', encoding='utf-8') as f:
         json.dump(data, f)
         
 def start_parser_task(mode):
     global parser_process
+    flag_path = os.path.join(DATA_DIR, 'stop.flag')
     if parser_process is None or parser_process.poll() is not None:
-        if os.path.exists('stop.flag'):
-            try: os.remove('stop.flag')
+        if os.path.exists(flag_path):
+            try: os.remove(flag_path)
             except OSError: pass
         # Процесс не запущен или уже завершился
         parser_process = subprocess.Popen(["python", "main.py", "--mode", mode])
@@ -145,7 +148,7 @@ from flask import send_file
 @app.route('/movies.zip')
 def download_db():
     try:
-        return send_file('movies.zip', as_attachment=True)
+        return send_file(os.path.join(DATA_DIR, 'movies.zip'), as_attachment=True)
     except FileNotFoundError:
         return abort(404)
 
@@ -154,7 +157,7 @@ def api_status():
     global parser_process
     
     is_running = parser_process is not None and parser_process.poll() is None
-    is_stopping = os.path.exists('stop.flag')
+    is_stopping = os.path.exists(os.path.join(DATA_DIR, 'stop.flag'))
     status = {'task': 'Idle', 'current': 0, 'total': 0, 'logs': [], 'is_running': is_running, 'is_stopping': is_stopping}
     
     # Считывание статистики БД
@@ -171,8 +174,9 @@ def api_status():
         
     # Считывание прогресса
     try:
-        if os.path.exists('progress.json'):
-            with open('progress.json', 'r', encoding='utf-8') as f:
+        progress_path = os.path.join(DATA_DIR, 'progress.json')
+        if os.path.exists(progress_path):
+            with open(progress_path, 'r', encoding='utf-8') as f:
                 prog = json.load(f)
                 status.update(prog)
     except:
@@ -180,8 +184,9 @@ def api_status():
         
     # Считывание логов
     try:
-        if os.path.exists('parser.log'):
-            with open('parser.log', 'r', encoding='utf-8') as f:
+        log_path = os.path.join(DATA_DIR, 'parser.log')
+        if os.path.exists(log_path):
+            with open(log_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
                 # Берем последние 50 строк лога
                 status['logs'] = [line.strip() for line in lines[-50:]]
@@ -214,7 +219,7 @@ def api_action():
         return jsonify({"status": "started"})
     elif action == 'stop':
         if parser_process is not None and parser_process.poll() is None:
-            with open('stop.flag', 'w') as f:
+            with open(os.path.join(DATA_DIR, 'stop.flag'), 'w') as f:
                 f.write('stop')
             return jsonify({"status": "stopping"})
         return jsonify({"status": "not_running"})

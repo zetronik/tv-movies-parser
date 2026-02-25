@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  parser:
+    build: .
+    container_name: tv-movies-parser
+    ports:
+      - "5000:5000"
+    volumes:
+      # Синхронизируем текущую папку с папкой /app внутри контейнера
+      - .:/app
+    env_file:
+      - .env.local
+    restart: unless-stopped

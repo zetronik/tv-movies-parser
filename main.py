@@ -11,10 +11,12 @@ from tqdm import tqdm
 from database import MovieDatabase
 from tmdb_client import TMDBClient
 from rutracker_client import RutrackerClient
+DATA_DIR = 'data/'
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # Настройка логирования
 logging.basicConfig(
-    filename='parser.log',
+    filename=os.path.join(DATA_DIR, 'parser.log'),
     filemode='w', # Очищаем файл при каждом запуске
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -23,32 +25,38 @@ logging.basicConfig(
 
 def update_progress(task_name, current, total):
     try:
-        tmp_name = 'progress.tmp'
+        tmp_name = os.path.join(DATA_DIR, 'progress.tmp')
         with open(tmp_name, 'w', encoding='utf-8') as f:
             json.dump({'task': task_name, 'current': current, 'total': total, 'timestamp': time.time()}, f)
-        os.replace(tmp_name, 'progress.json')
+        os.replace(tmp_name, os.path.join(DATA_DIR, 'progress.json'))
     except Exception as e:
         print(f"Progress error: {e}")
 
 def get_config():
     try:
-        with open('parser_config.json', 'r', encoding='utf-8') as f:
+        with open(os.path.join(DATA_DIR, 'parser_config.json'), 'r', encoding='utf-8') as f:
             return json.load(f)
     except:
         return {"run_tmdb": True, "run_rutracker": True, "cron_time": "02:00"}
 
 def create_zip(db_name="movies.db"):
+    # Если db_name - это просто имя файла, то допишем DATA_DIR
+    if not db_name.startswith(DATA_DIR):
+        db_name = os.path.join(DATA_DIR, os.path.basename(db_name))
+        
     update_progress("Сжатие базы данных", 99, 100)
     logging.info("Сжатие базы данных...")
     try:
-        temp_zip = "movies_temp.zip"
+        temp_zip = os.path.join(DATA_DIR, "movies_temp.zip")
+        final_zip = os.path.join(DATA_DIR, "movies.zip")
         with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(db_name)
+            # Кладем внутрь архива сам файл (чтобы внутри не было пути DATA_DIR)
+            zipf.write(db_name, arcname=os.path.basename(db_name))
         
         # Безопасная замена файла (с попытками, если файл сейчас скачивают)
         for _ in range(5):
             try:
-                os.replace(temp_zip, "movies.zip")
+                os.replace(temp_zip, final_zip)
                 break
             except PermissionError:
                 time.sleep(2)
@@ -66,9 +74,10 @@ def main():
     update_progress("Инициализация", 0, 100)
     logging.info(f"--- Запуск парсера фильмов (Режим: {args.mode}) ---")
     
-    if os.path.exists('stop.flag'):
+    flag_path = os.path.join(DATA_DIR, 'stop.flag')
+    if os.path.exists(flag_path):
         try:
-            os.remove('stop.flag')
+            os.remove(flag_path)
         except OSError:
             pass
 
@@ -114,7 +123,7 @@ def main():
                 saved_count = 0
                 total_tmdb = len(ids_to_process)
                 for i, movie_id in enumerate(tqdm(ids_to_process, desc="Парсинг TMDB", leave=True)):
-                    if os.path.exists('stop.flag'):
+                    if os.path.exists(flag_path):
                         logging.info("Обнаружен сигнал остановки stop.flag. Прерывание цикла TMDB...")
                         break
 
@@ -184,7 +193,7 @@ def main():
             logging.info("Парсинг TMDB отключен или не запрошен в этом режиме.")
 
         # 3. Полный прогон парсера Рутрекера
-        if run_rutracker and not os.path.exists('stop.flag'):
+        if run_rutracker and not os.path.exists(flag_path):
             update_progress("Парсинг Rutracker", 0, 100)
             logging.info("Запуск парсера Rutracker (режим сканирования форумов)...")
             rutracker = RutrackerClient()
@@ -193,20 +202,20 @@ def main():
                 target_categories = [2, 18] # 2 - Кино, 18 - Сериалы
                 
                 for cat_id in target_categories:
-                    if os.path.exists('stop.flag'): break
+                    if os.path.exists(flag_path): break
                     
                     logging.info(f"Сбор форумов для категории {cat_id}...")
                     forum_ids = rutracker.get_forums_from_category(cat_id)
                     
                     for forum_id in forum_ids:
-                        if os.path.exists('stop.flag'): break
+                        if os.path.exists(flag_path): break
                         logging.info(f"Сканирование подраздела f={forum_id}...")
                         
                         # Смотрим первые 2 страницы (свежие раздачи)
                         topics = rutracker.get_topics_from_forum(forum_id, pages=2)
                         
                         for topic in topics:
-                            if os.path.exists('stop.flag'): break
+                            if os.path.exists(flag_path): break
                             
                             ru_title, orig_title, year = rutracker.parse_topic_title(topic['title'])
                             movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
@@ -240,9 +249,9 @@ def main():
     finally:
         # 4. Архивация базы данных всегда выполняется
         create_zip(db.db_name if 'db' in locals() else "movies.db")
-        if os.path.exists('stop.flag'):
+        if os.path.exists(flag_path):
             try:
-                os.remove('stop.flag')
+                os.remove(flag_path)
             except OSError:
                 pass
         logging.info("--- Работа скрипта завершена ---")

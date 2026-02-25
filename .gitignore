@@ -1,10 +1,26 @@
-.env
-movies.zip
-movies.db
+# Python
 __pycache__/
-*.pyc
-*.log
-.idea
-.venv
-.git
-progress.jsons
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Секреты и конфиги окружения
+.env
+.env.*
+!.env.example
+
+# База данных и архивы парсера
+data/
+movies.db
+movies.zip
+movies_temp.zip
+
+# Динамические файлы состояния (генерируются сами)
+progress.json
+progress.tmp
+parser.log
+stop.flag
+parser_config.json
+
+.idea/

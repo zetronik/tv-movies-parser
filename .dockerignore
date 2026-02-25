@@ -1,0 +1,19 @@
+# Игнорируем виртуальные окружения
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Игнорируем рабочие данные и базу, чтобы они не попали в образ!
+data/
+movies.db
+movies.zip
+progress.json
+parser.log
+stop.flag
+parser_config.json
+
+# Игнорируем секреты
+.env
+.env.*
+!.env.example

@@ -1,5 +1,8 @@
+flask
+apscheduler
 requests
 python-dotenv
 beautifulsoup4
 lxml
 tqdm
+waitress

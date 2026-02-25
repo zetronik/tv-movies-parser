@@ -1,7 +1,7 @@
 import sqlite3
 
 class MovieDatabase:
-    def __init__(self, db_name="movies.db"):
+    def __init__(self, db_name="data/movies.db"):
         self.db_name = db_name
         self._create_tables()
 
