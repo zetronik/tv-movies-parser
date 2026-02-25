@@ -114,11 +114,10 @@ def main():
                 logging.error(f"Ошибка при получении списков ID: {e}")
                 sys.exit(1)
 
-            # Обработка TMDB (ограничена 100 для скорости тестирования)
+            # Обработка TMDB
             if ids_to_fetch:
-                limit = 100
-                ids_to_process = list(ids_to_fetch)[:limit]
-                logging.info(f"[3/3] Начинаем загрузку TMDB (взято {limit} ID для теста)...")
+                ids_to_process = list(ids_to_fetch)
+                logging.info(f"[3/3] Начинаем загрузку TMDB (всего {len(ids_to_process)} ID новых фильмов)...")
 
                 saved_count = 0
                 total_tmdb = len(ids_to_process)
