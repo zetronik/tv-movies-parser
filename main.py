@@ -1,4 +1,6 @@
 import sys
+import boto3
+from botocore.client import Config
 import time
 import requests
 import json
@@ -39,8 +41,32 @@ def get_config():
     except:
         return {"run_tmdb": True, "run_rutracker": True, "cron_time": "02:00"}
 
+def upload_to_r2(file_path):
+    endpoint_url = os.environ.get('R2_ENDPOINT_URL')
+    access_key = os.environ.get('R2_ACCESS_KEY_ID')
+    secret_key = os.environ.get('R2_SECRET_ACCESS_KEY')
+    bucket_name = os.environ.get('R2_BUCKET_NAME')
+    
+    if not all([endpoint_url, access_key, secret_key, bucket_name]):
+        logging.warning("Ключи R2 не заданы. Пропуск загрузки в облако.")
+        return
+    try:
+        update_progress("Выгрузка в облако", 99, 100)
+        logging.info(f"Начало загрузки {file_path} в Cloudflare R2...")
+        
+        s3 = boto3.client('s3',
+            endpoint_url=endpoint_url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            config=Config(signature_version='s3v4')
+        )
+        
+        s3.upload_file(file_path, bucket_name, 'movies.zip')
+        logging.info("Успешная загрузка в Cloudflare R2!")
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке в R2: {e}")
+
 def create_zip(db_name="movies.db"):
-    # Если db_name - это просто имя файла, то допишем DATA_DIR
     if not db_name.startswith(DATA_DIR):
         db_name = os.path.join(DATA_DIR, os.path.basename(db_name))
         
@@ -62,6 +88,8 @@ def create_zip(db_name="movies.db"):
                 time.sleep(2)
                 
         logging.info("База данных успешно сжата в movies.zip")
+        # Загружаем в облако
+        upload_to_r2(os.path.join(DATA_DIR, "movies.zip"))
     except Exception as e:
         logging.error(f"Ошибка при сжатии базы данных: {e}")
 

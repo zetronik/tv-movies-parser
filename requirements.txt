@@ -6,3 +6,4 @@ beautifulsoup4
 lxml
 tqdm
 waitress
+boto3
