@@ -1,9 +1,12 @@
 import sqlite3
+import threading
 
+db_lock = threading.Lock()
 class MovieDatabase:
     def __init__(self, db_name="data/movies.db"):
         self.db_name = db_name
         self._create_tables()
+        self._run_migrations()
 
     def get_connection(self):
         return sqlite3.connect(self.db_name)
@@ -22,7 +25,8 @@ class MovieDatabase:
             genres TEXT,
             countries TEXT,
             directors TEXT,
-            actors TEXT
+            actors TEXT,
+            media_type TEXT DEFAULT 'movie'
         )
         """
         
@@ -42,10 +46,27 @@ class MovieDatabase:
             FOREIGN KEY(movie_id) REFERENCES movies(id)
         )
         """
+        now_playing_query = """
+        CREATE TABLE IF NOT EXISTS now_playing (
+            movie_id INTEGER PRIMARY KEY,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(movie_id) REFERENCES movies(id)
+        )
+        """
         with self.get_connection() as conn:
             conn.execute(movies_query)
             conn.execute(torrents_query)
+            conn.execute(now_playing_query)
             conn.commit()
+
+    def _run_migrations(self):
+        with db_lock:
+            with self.get_connection() as conn:
+                cursor = conn.execute("PRAGMA table_info(movies)")
+                columns = [info[1] for info in cursor.fetchall()]
+                if 'media_type' not in columns:
+                    conn.execute("ALTER TABLE movies ADD COLUMN media_type TEXT DEFAULT 'movie'")
+                    conn.commit()
 
     def get_existing_ids(self):
         """Возвращает множество ID фильмов, которые уже есть в базе."""
@@ -84,13 +105,14 @@ class MovieDatabase:
         query = """
         INSERT OR REPLACE INTO movies (
             id, title, original_title, overview, rating, release_date, poster_url,
-            genres, countries, directors, actors
+            genres, countries, directors, actors, media_type
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
-        with self.get_connection() as conn:
-            conn.execute(query, movie_data)
-            conn.commit()
+        with db_lock:
+            with self.get_connection() as conn:
+                conn.execute(query, movie_data)
+                conn.commit()
 
     def insert_torrent(self, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches):
         """
@@ -103,9 +125,10 @@ class MovieDatabase:
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
-        with self.get_connection() as conn:
-            conn.execute(query, (movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches))
-            conn.commit()
+        with db_lock:
+            with self.get_connection() as conn:
+                conn.execute(query, (movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches))
+                conn.commit()
 
     def find_movie_by_title_and_year(self, title, original_title, year):
         """
@@ -137,3 +160,12 @@ class MovieDatabase:
             if result: return result[0]
             
         return None
+
+    def update_now_playing_list(self, movie_ids):
+        """Очищает старый список 'Сейчас смотрят' и вставляет новый"""
+        with db_lock:
+            with self.get_connection() as conn:
+                conn.execute("DELETE FROM now_playing")
+                for mid in movie_ids:
+                    conn.execute("INSERT OR IGNORE INTO now_playing (movie_id) VALUES (?)", (mid,))
+                conn.commit()

@@ -1,5 +1,8 @@
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
+import hashlib
 from botocore.client import Config
 import time
 import requests
@@ -61,7 +64,8 @@ def upload_to_r2(file_path):
             config=Config(signature_version='s3v4')
         )
         
-        s3.upload_file(file_path, bucket_name, 'movies.zip')
+        object_name = os.path.basename(file_path)
+        s3.upload_file(file_path, bucket_name, object_name)
         logging.info("Успешная загрузка в Cloudflare R2!")
     except Exception as e:
         logging.error(f"Ошибка при загрузке в R2: {e}")
@@ -88,14 +92,128 @@ def create_zip(db_name="movies.db"):
                 time.sleep(2)
                 
         logging.info("База данных успешно сжата в movies.zip")
-        # Загружаем в облако
-        upload_to_r2(os.path.join(DATA_DIR, "movies.zip"))
+        
+        final_zip = os.path.join(DATA_DIR, "movies.zip")
+        md5_file = os.path.join(DATA_DIR, "movies.md5")
+        
+        # Генерируем MD5 хеш
+        md5_hash = hashlib.md5()
+        with open(final_zip, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                md5_hash.update(chunk)
+        hash_str = md5_hash.hexdigest()
+        
+        # Сохраняем в файл
+        with open(md5_file, "w") as f:
+            f.write(hash_str)
+            
+        logging.info(f"Сгенерирован MD5 хеш: {hash_str}")
+        
+        # Загружаем в облако оба файла
+        upload_to_r2(final_zip)
+        upload_to_r2(md5_file)
     except Exception as e:
         logging.error(f"Ошибка при сжатии базы данных: {e}")
 
+def process_tmdb_movie(movie_id, db, tmdb_client):
+    try:
+        movie = tmdb_client.get_movie_details(movie_id)
+        
+        title = movie.get("title")
+        original_title = movie.get("original_title")
+        overview = movie.get("overview")
+        rating = movie.get("vote_average")
+        release_date = movie.get("release_date")
+        poster_path = movie.get("poster_path")
+        
+        full_poster_url = tmdb_client.get_full_poster_url(poster_path)
+        
+        # Извлечение данных
+        genres = ", ".join([g.get("name", "") for g in movie.get("genres", []) if g.get("name")])
+        countries = ", ".join([c.get("name", "") for c in movie.get("production_countries", []) if c.get("name")])
+        
+        credits = movie.get("credits", {})
+        
+        # Режиссеры
+        directors = ", ".join([
+            crew_member.get("name", "") 
+            for crew_member in credits.get("crew", []) 
+            if crew_member.get("job") == "Director" and crew_member.get("name")
+        ])
+        
+        # Актёры
+        actors = ", ".join([
+            cast_member.get("name", "") 
+            for cast_member in credits.get("cast", [])[:10] 
+            if cast_member.get("name")
+        ])
+        
+        movie_data = (
+            movie_id,
+            title,
+            original_title,
+            overview,
+            rating,
+            release_date,
+            full_poster_url,
+            genres,
+            countries,
+            directors,
+            actors,
+            'movie'
+        )
+        
+        db.upsert_movie(movie_data)
+        logging.info(f"Сохранен фильм ID {movie_id}: {title}")
+        return True
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            logging.info(f"ID {movie_id} не найден. Пропускаем.")
+        else:
+            logging.error(f"HTTP ошибка для ID {movie_id}: {e}")
+    except Exception as e:
+        logging.error(f"Ошибка при обработке ID {movie_id}: {e}")
+    return False
+
+def process_tmdb_tv(tv_id_shifted, db, tmdb_client):
+    real_id = tv_id_shifted - 100000000
+    try:
+        tv = tmdb_client.get_tv_details(real_id)
+        title = tv.get("name")
+        original_title = tv.get("original_name")
+        overview = tv.get("overview")
+        rating = tv.get("vote_average")
+        release_date = tv.get("first_air_date", "")
+        poster_path = tv.get("poster_path")
+        full_poster_url = tmdb_client.get_full_poster_url(poster_path)
+        
+        # Принудительно добавляем тег "Сериал", чтобы клиент Flutter его распознал
+        genres_list = [g.get("name", "") for g in tv.get("genres", []) if g.get("name")]
+        if "Сериал" not in genres_list: genres_list.append("Сериал")
+        genres = ", ".join(genres_list)
+        
+        countries = ", ".join([c.get("name", "") for c in tv.get("production_countries", []) if c.get("name")])
+        credits = tv.get("credits", {})
+        directors = ", ".join([creator.get("name", "") for creator in tv.get("created_by", [])])
+        actors = ", ".join([cast_member.get("name", "") for cast_member in credits.get("cast", [])[:10] if cast_member.get("name")])
+        
+        movie_data = (tv_id_shifted, title, original_title, overview, rating, release_date, full_poster_url, genres, countries, directors, actors, 'tv')
+        db.upsert_movie(movie_data)
+        logging.info(f"Сохранен сериал ID {real_id}: {title}")
+        return True
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            logging.info(f"Сериал ID {real_id} не найден. Пропускаем.")
+        else:
+            logging.error(f"HTTP ошибка для сериала ID {real_id}: {e}")
+    except Exception as e:
+        logging.error(f"Ошибка при обработке сериала ID {real_id}: {e}")
+    return False
+
 def main():
     parser = argparse.ArgumentParser(description="Movies Parser")
-    parser.add_argument('--mode', choices=['tmdb', 'rutracker', 'cron'], required=True, help='Режим работы парсера')
+    parser.add_argument('--mode', choices=['tmdb', 'rutracker', 'cron', 'trends'], required=True, help='Режим работы парсера')
     args = parser.parse_args()
 
     config = get_config()
@@ -120,24 +238,30 @@ def main():
 
         run_tmdb = args.mode == 'tmdb' or (args.mode == 'cron' and config.get("run_tmdb", True))
         run_rutracker = args.mode == 'rutracker' or (args.mode == 'cron' and config.get("run_rutracker", True))
+        run_trends = args.mode == 'trends' or run_tmdb
 
-        # 2. Обработка TMDB
-        if run_tmdb:
+        # 1.5 Инициализация TMDB клиента если нужно
+        if run_tmdb or run_trends:
             tmdb_client = TMDBClient()
             if not tmdb_client.read_token and not tmdb_client.api_key:
                 logging.error("Ошибка: API ключи TMDB не найдены в файле .env. Пожалуйста, заполните их.")
                 sys.exit(1)
 
-            logging.info("[2/3] Получение списков ID фильмов...")
+        # 2. Обработка TMDB (полная база)
+        if run_tmdb:
+            logging.info("[2/3] Получение списков ID фильмов и сериалов...")
             try:
                 local_ids = db.get_existing_ids()
-                logging.info(f"ID в локальной базе: {len(local_ids)}")
                 
-                tmdb_ids = tmdb_client.download_daily_movie_ids()
-                logging.info(f"ID в базе TMDB (export): {len(tmdb_ids)}")
+                tmdb_movie_ids = tmdb_client.download_daily_movie_ids()
+                ids_to_fetch_movies = tmdb_movie_ids - local_ids
                 
-                ids_to_fetch = tmdb_ids - local_ids
-                logging.info(f"Новых ID для скачивания: {len(ids_to_fetch)}")
+                tmdb_tv_ids = tmdb_client.download_daily_tv_ids()
+                shifted_tv_ids = {tid + 100000000 for tid in tmdb_tv_ids}
+                ids_to_fetch_tv = shifted_tv_ids - local_ids
+                
+                ids_to_fetch = ids_to_fetch_movies.union(ids_to_fetch_tv)
+                logging.info(f"Новых фильмов: {len(ids_to_fetch_movies)}, новых сериалов: {len(ids_to_fetch_tv)}")
             except Exception as e:
                 logging.error(f"Ошибка при получении списков ID: {e}")
                 sys.exit(1)
@@ -145,79 +269,97 @@ def main():
             # Обработка TMDB
             if ids_to_fetch:
                 ids_to_process = list(ids_to_fetch)
-                logging.info(f"[3/3] Начинаем загрузку TMDB (всего {len(ids_to_process)} ID новых фильмов)...")
+                logging.info(f"[3/3] Начинаем загрузку TMDB (всего {len(ids_to_process)} новых ID)...")
 
                 saved_count = 0
                 total_tmdb = len(ids_to_process)
-                for i, movie_id in enumerate(tqdm(ids_to_process, desc="Парсинг TMDB", leave=True)):
-                    if os.path.exists(flag_path):
-                        logging.info("Обнаружен сигнал остановки stop.flag. Прерывание цикла TMDB...")
-                        break
-
-                    update_progress("Парсинг TMDB", i, total_tmdb)
-                    try:
-                        movie = tmdb_client.get_movie_details(movie_id)
+                
+                max_workers = 15
+                
+                def process_item(item_id, db, tmdb_client):
+                    if item_id > 100000000:
+                        return process_tmdb_tv(item_id, db, tmdb_client)
+                    else:
+                        return process_tmdb_movie(item_id, db, tmdb_client)
                         
-                        title = movie.get("title")
-                        original_title = movie.get("original_title")
-                        overview = movie.get("overview")
-                        rating = movie.get("vote_average")
-                        release_date = movie.get("release_date")
-                        poster_path = movie.get("poster_path")
-                        
-                        full_poster_url = tmdb_client.get_full_poster_url(poster_path)
-                        
-                        # Извлечение данных
-                        genres = ", ".join([g.get("name", "") for g in movie.get("genres", []) if g.get("name")])
-                        countries = ", ".join([c.get("name", "") for c in movie.get("production_countries", []) if c.get("name")])
-                        
-                        credits = movie.get("credits", {})
-                        
-                        # Режиссеры
-                        directors = ", ".join([
-                            crew_member.get("name", "") 
-                            for crew_member in credits.get("crew", []) 
-                            if crew_member.get("job") == "Director" and crew_member.get("name")
-                        ])
-                        
-                        # Актёры
-                        actors = ", ".join([
-                            cast_member.get("name", "") 
-                            for cast_member in credits.get("cast", [])[:10] 
-                            if cast_member.get("name")
-                        ])
-                        
-                        movie_data = (
-                            movie_id,
-                            title,
-                            original_title,
-                            overview,
-                            rating,
-                            release_date,
-                            full_poster_url,
-                            genres,
-                            countries,
-                            directors,
-                            actors
-                        )
-                        
-                        db.upsert_movie(movie_data)
-                        logging.info(f"Сохранен фильм ID {movie_id}: {title}")
-                        saved_count += 1
-                        
-                    except requests.exceptions.HTTPError as e:
-                        if e.response.status_code == 404:
-                            logging.info(f"ID {movie_id} не найден. Пропускаем.")
-                        else:
-                            logging.error(f"HTTP ошибка для ID {movie_id}: {e}")
-                    except Exception as e:
-                        logging.error(f"Ошибка при обработке ID {movie_id}: {e}")
-                        
-                    time.sleep(0.05)
+                import concurrent.futures
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    active_tasks = set()
+                    id_iterator = iter(ids_to_process)
+                    
+                    # Пул начинается с небольшого запаса задач
+                    for _ in range(max_workers * 2):
+                        try:
+                            item_id = next(id_iterator)
+                            active_tasks.add(executor.submit(process_item, item_id, db, tmdb_client))
+                        except StopIteration:
+                            break
+                    
+                    with tqdm(total=total_tmdb, desc="Парсинг TMDB") as pbar:
+                        while active_tasks:
+                            if os.path.exists(flag_path):
+                                logging.info("Получен сигнал остановки, прерываем парсинг TMDB.")
+                                try:
+                                    executor.shutdown(wait=False, cancel_futures=True)
+                                except TypeError:
+                                    executor.shutdown(wait=False) # Для старых версий Python
+                                break
+                            
+                            # Ждем завершения хотя бы одной задачи, или просыпаемся раз в секунду
+                            done, active_tasks = concurrent.futures.wait(active_tasks, timeout=1.0, return_when=concurrent.futures.FIRST_COMPLETED)
+                            
+                            for future in done:
+                                try:
+                                    if future.result():
+                                        saved_count += 1
+                                except Exception as e:
+                                    logging.error(f"Ошибка в потоке при обработке фильма/сериала: {e}")
+                                
+                                pbar.update(1)
+                                update_progress("Парсинг TMDB", pbar.n, total_tmdb)
+                                
+                                # Добавляем новую задачу в пул взамен завершенной
+                                try:
+                                    next_item_id = next(id_iterator)
+                                    active_tasks.add(executor.submit(process_item, next_item_id, db, tmdb_client))
+                                except StopIteration:
+                                    pass
             else:
                 logging.info("База фильмов TMDB актуальна.")
         else:
-            logging.info("Парсинг TMDB отключен или не запрошен в этом режиме.")
+            if args.mode != 'trends':
+                logging.info("Парсинг TMDB отключен (работает другой режим).")
+
+        # 2.5 Обработка трендов "Сейчас смотрят"
+        if run_trends:
+            if not os.path.exists(flag_path):
+                update_progress("Обновление 'Сейчас смотрят'", 0, 100)
+                logging.info("Получение списка 'Сейчас смотрят' (фильмы и сериалы)...")
+                try:
+                    now_playing_m = tmdb_client.get_now_playing_movies()
+                    trending_tv = tmdb_client.get_trending_tv_shows()
+                    
+                    # Сдвигаем ID сериалов
+                    shifted_tv_ids = [tid + 100000000 for tid in trending_tv]
+                    all_trending_ids = now_playing_m + shifted_tv_ids
+                    
+                    # Проверяем, есть ли эти фильмы в нашей базе, если нет - докачиваем
+                    local_ids = db.get_existing_ids()
+                    missing_ids = [mid for mid in all_trending_ids if mid not in local_ids]
+                    
+                    if missing_ids:
+                        logging.info(f"Докачиваем {len(missing_ids)} недостающих фильмов/сериалов для раздела трендов...")
+                        for mid in missing_ids:
+                            if mid > 100000000:
+                                process_tmdb_tv(mid, db, tmdb_client)
+                            else:
+                                process_tmdb_movie(mid, db, tmdb_client)
+                                
+                    # Обновляем таблицу
+                    db.update_now_playing_list(all_trending_ids)
+                    logging.info(f"Раздел 'Сейчас смотрят' обновлен. Всего: {len(all_trending_ids)} элементов.")
+                except Exception as e:
+                    logging.error(f"Ошибка при обновлении 'Сейчас смотрят': {e}")
 
         # 3. Полный прогон парсера Рутрекера
         if run_rutracker and not os.path.exists(flag_path):

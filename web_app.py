@@ -75,15 +75,17 @@ def index():
             SELECT COUNT(*) FROM movies 
             WHERE id NOT IN (SELECT DISTINCT movie_id FROM torrents)
         """).fetchone()[0]
+        now_playing_count = conn.execute("SELECT COUNT(*) FROM now_playing").fetchone()[0]
         conn.close()
     except sqlite3.OperationalError:
-        movies_count, torrents_count, movies_without_torrents = 0, 0, 0
+        movies_count, torrents_count, movies_without_torrents, now_playing_count = 0, 0, 0, 0
 
     return render_template(
         'index.html', 
         movies_count=movies_count, 
         torrents_count=torrents_count,
-        movies_without_torrents=movies_without_torrents
+        movies_without_torrents=movies_without_torrents,
+        now_playing_count=now_playing_count
     )
 
 @app.route('/movies')
@@ -140,6 +142,41 @@ def movie_detail(movie_id):
     
     return render_template('movie_detail.html', movie=movie, torrents=torrents)
 
+@app.route('/now_playing')
+def now_playing():
+    page = request.args.get('page', 1, type=int)
+    per_page = 20
+    offset = (page - 1) * per_page
+
+    conn = get_db_connection()
+    
+    query_sql = """
+        SELECT m.*, np.added_at 
+        FROM now_playing np 
+        JOIN movies m ON np.movie_id = m.id 
+        ORDER BY np.added_at DESC 
+        LIMIT ? OFFSET ?
+    """
+    count_sql = "SELECT COUNT(*) FROM now_playing"
+    
+    try:
+        items_list = conn.execute(query_sql, (per_page, offset)).fetchall()
+        total_items = conn.execute(count_sql).fetchone()[0]
+    except sqlite3.OperationalError:
+        items_list = []
+        total_items = 0
+
+    conn.close()
+
+    total_pages = math.ceil(total_items / per_page) if total_items > 0 else 0
+    
+    return render_template(
+        'now_playing.html', 
+        items=items_list, 
+        page=page, 
+        total_pages=total_pages
+    )
+
 import os
 import json
 
@@ -166,11 +203,13 @@ def api_status():
         status['movies_count'] = conn.execute("SELECT COUNT(*) FROM movies").fetchone()[0]
         status['torrents_count'] = conn.execute("SELECT COUNT(*) FROM torrents").fetchone()[0]
         status['movies_without_torrents'] = conn.execute("SELECT COUNT(*) FROM movies WHERE id NOT IN (SELECT DISTINCT movie_id FROM torrents)").fetchone()[0]
+        status['now_playing_count'] = conn.execute("SELECT COUNT(*) FROM now_playing").fetchone()[0]
         conn.close()
     except:
         status['movies_count'] = 0
         status['torrents_count'] = 0
         status['movies_without_torrents'] = 0
+        status['now_playing_count'] = 0
         
     # Считывание прогресса
     try:
@@ -214,16 +253,54 @@ def api_action():
     if action == 'start_tmdb':
         start_parser_task('tmdb')
         return jsonify({"status": "started"})
+    elif action == 'start_trends':
+        start_parser_task('trends')
+        return jsonify({"status": "started"})
     elif action == 'start_rutracker':
         start_parser_task('rutracker')
         return jsonify({"status": "started"})
     elif action == 'stop':
+        # БЕЗУСЛОВНО создаем флаг остановки, даже если процесс - "сирота"
+        with open(os.path.join(DATA_DIR, 'stop.flag'), 'w') as f:
+            f.write('stop')
+            
+        # Если мы все еще отслеживаем процесс - можем попытаться его мягко завершить
         if parser_process is not None and parser_process.poll() is None:
-            with open(os.path.join(DATA_DIR, 'stop.flag'), 'w') as f:
-                f.write('stop')
-            return jsonify({"status": "stopping"})
-        return jsonify({"status": "not_running"})
+            pass # Процесс сам завершится, прочитав stop.flag
+            
+        return jsonify({"status": "stopping"})
+    elif action == 'clear_lock':
+        flag_path = os.path.join(DATA_DIR, 'stop.flag')
+        if os.path.exists(flag_path):
+            try: os.remove(flag_path)
+            except OSError: pass
+        return jsonify({"status": "cleared"})
+        
     return abort(400)
+
+@app.route('/api/shutdown', methods=['POST'])
+def api_shutdown():
+    global parser_process
+    
+    # 1. Создаем флаг остановки для любых зависших фоновых скриптов
+    with open(os.path.join(DATA_DIR, 'stop.flag'), 'w') as f:
+        f.write('stop')
+        
+    # 2. Принудительно убиваем отслеживаемый процесс, если он жив
+    if parser_process is not None and parser_process.poll() is None:
+        try:
+            parser_process.terminate()
+        except:
+            pass
+            
+    # 3. Убиваем сам веб-сервер через 1 секунду (чтобы успеть отдать ответ)
+    import threading
+    def kill_process():
+        time.sleep(1)
+        os._exit(0)
+    threading.Thread(target=kill_process, daemon=True).start()
+    
+    return jsonify({"status": "shutting_down"})
 
 if __name__ == '__main__':
     from waitress import serve
