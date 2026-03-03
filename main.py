@@ -386,15 +386,23 @@ def main():
                         for topic in topics:
                             if os.path.exists(flag_path): break
                             
+                            topic_id = topic['topic_id']
+                            
+                            # Если топик уже есть - просто обновляем сиды без захода внутрь
+                            if db.is_torrent_exists(topic_id):
+                                db.update_torrent_seeds(topic_id, topic['seeds'], topic['leeches'])
+                                continue
+                                
                             ru_title, orig_title, year = rutracker.parse_topic_title(topic['title'])
                             movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
                             
                             if movie_id:
-                                logging.info(f"Найдено совпадение: {ru_title} ({year}) -> ID БД: {movie_id}")
-                                details = rutracker.get_topic_details(topic['topic_id'])
+                                logging.info(f"Новая раздача: {ru_title} ({year}) -> ID БД: {movie_id}")
+                                details = rutracker.get_topic_details(topic_id)
                                 
                                 if details and details.get('magnet'):
                                     db.insert_torrent(
+                                        topic_id=topic_id,
                                         movie_id=movie_id,
                                         topic_title=topic['title'],
                                         size_gb=round(details['size_gb'], 2),
@@ -402,10 +410,10 @@ def main():
                                         file_format='', 
                                         translation='', 
                                         magnet_link=details['magnet'],
-                                        seeds=details.get('seeds', 0),
-                                        leeches=details.get('leeches', 0)
+                                        seeds=details.get('seeds', topic['seeds']),
+                                        leeches=details.get('leeches', topic['leeches'])
                                     )
-                            time.sleep(1.5) # Пауза между раздачами, чтобы не получить бан
+                                time.sleep(1.5)
                             
             except Exception as e:
                 logging.error(f"Ошибка в главном цикле парсинга Rutracker: {e}")

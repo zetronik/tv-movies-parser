@@ -33,6 +33,7 @@ class MovieDatabase:
         torrents_query = """
         CREATE TABLE IF NOT EXISTS torrents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id INTEGER UNIQUE,
             movie_id INTEGER,
             topic_title TEXT,
             size_gb REAL,
@@ -67,6 +68,14 @@ class MovieDatabase:
                 if 'media_type' not in columns:
                     conn.execute("ALTER TABLE movies ADD COLUMN media_type TEXT DEFAULT 'movie'")
                     conn.commit()
+
+                # Migration for torrents table to add topic_id
+                cursor = conn.execute("PRAGMA table_info(torrents)")
+                columns = [info[1] for info in cursor.fetchall()]
+                if 'topic_id' not in columns:
+                    conn.execute("DROP TABLE torrents")
+                    conn.commit()
+                    self._create_tables()
 
     def get_existing_ids(self):
         """Возвращает множество ID фильмов, которые уже есть в базе."""
@@ -114,20 +123,28 @@ class MovieDatabase:
                 conn.execute(query, movie_data)
                 conn.commit()
 
-    def insert_torrent(self, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches):
-        """
-        Добавляет информацию о торрент-раздаче в БД.
-        Использует INSERT OR IGNORE для избежания дубликатов по movie_id и magnet_link.
-        """
+    def insert_torrent(self, topic_id, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches):
         query = """
         INSERT OR IGNORE INTO torrents (
-            movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches
+            topic_id, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         with db_lock:
             with self.get_connection() as conn:
-                conn.execute(query, (movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches))
+                conn.execute(query, (topic_id, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches))
+                conn.commit()
+
+    def is_torrent_exists(self, topic_id):
+        query = "SELECT 1 FROM torrents WHERE topic_id = ?"
+        with self.get_connection() as conn:
+            return conn.execute(query, (topic_id,)).fetchone() is not None
+
+    def update_torrent_seeds(self, topic_id, seeds, leeches):
+        query = "UPDATE torrents SET seeds = ?, leeches = ? WHERE topic_id = ?"
+        with db_lock:
+            with self.get_connection() as conn:
+                conn.execute(query, (seeds, leeches, topic_id))
                 conn.commit()
 
     def find_movie_by_title_and_year(self, title, original_title, year):

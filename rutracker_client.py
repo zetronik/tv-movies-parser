@@ -189,27 +189,51 @@ class RutrackerClient:
         return None, None, None
 
     def get_topics_from_forum(self, forum_id, pages=1):
-        """
-        Проходит по страницам форума и собирает ссылки на топики и их заголовки.
-        """
         topics = []
         for page in range(pages):
-            # Рутрекер использует смещение (start) кратное 50 для пагинации
             start = page * 50
             url = f"https://rutracker.org/forum/viewforum.php?f={forum_id}&start={start}"
-            
             response = self.session.get(url)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'lxml')
             
-            # Ищем все ссылки на топики в таблице
-            for a_tag in soup.select('a.tt-text'):
+            # Находим разделитель "Темы"
+            separator = soup.find(lambda tag: tag.name == 'td' and 'topicSep' in tag.get('class', []) and 'Темы' in tag.text)
+            
+            if separator:
+                trs = separator.parent.find_next_siblings('tr', class_='hl-tr')
+            else:
+                trs = soup.select('tr.hl-tr')
+                
+            for row in trs:
+                a_tag = row.select_one('a.tt-text')
+                if not a_tag: continue
+                
                 title = a_tag.text.strip()
+                
+                # Фильтрация DVD форматов
+                if re.search(r'DVD(-?Video|5|9)', title, re.IGNORECASE):
+                    continue
+                    
                 href = a_tag.get('href')
                 if href and 'viewtopic.php?t=' in href:
-                    topic_id = href.split('t=')[-1]
+                    topic_id = int(href.split('t=')[-1])
+                    
+                    seeds, leeches = 0, 0
+                    seed_tag = row.find(class_=re.compile(r'seedmed')) or row.find(title="Сиды")
+                    if seed_tag:
+                        s_text = re.sub(r'\D', '', seed_tag.text)
+                        if s_text: seeds = int(s_text)
+                        
+                    leech_tag = row.find(class_=re.compile(r'leechmed')) or row.find(title="Личи")
+                    if leech_tag:
+                        l_text = re.sub(r'\D', '', leech_tag.text)
+                        if l_text: leeches = int(l_text)
+                    
                     topics.append({
                         'topic_id': topic_id,
-                        'title': title
+                        'title': title,
+                        'seeds': seeds,
+                        'leeches': leeches
                     })
         return topics
