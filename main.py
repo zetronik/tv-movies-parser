@@ -240,12 +240,11 @@ def main():
         run_rutracker = args.mode == 'rutracker' or (args.mode == 'cron' and config.get("run_rutracker", True))
         run_trends = args.mode == 'trends' or run_tmdb
 
-        # 1.5 Инициализация TMDB клиента если нужно
-        if run_tmdb or run_trends:
-            tmdb_client = TMDBClient()
-            if not tmdb_client.read_token and not tmdb_client.api_key:
-                logging.error("Ошибка: API ключи TMDB не найдены в файле .env. Пожалуйста, заполните их.")
-                sys.exit(1)
+        # 1.5 Инициализация TMDB клиента
+        tmdb_client = TMDBClient()
+        if not tmdb_client.read_token and not tmdb_client.api_key:
+            logging.error("Ошибка: API ключи TMDB не найдены в файле .env. Пожалуйста, заполните их.")
+            sys.exit(1)
 
         # 2. Обработка TMDB (полная база)
         if run_tmdb:
@@ -381,39 +380,68 @@ def main():
                         logging.info(f"Сканирование подраздела f={forum_id}...")
                         
                         # Смотрим первые 2 страницы (свежие раздачи)
-                        topics = rutracker.get_topics_from_forum(forum_id, pages=2)
+                        try:
+                            topics = rutracker.get_topics_from_forum(forum_id, pages=2)
+                        except Exception as e:
+                            logging.error(f"Ошибка при получении топиков форума {forum_id}: {e}")
+                            time.sleep(2)
+                            continue
                         
                         for topic in topics:
                             if os.path.exists(flag_path): break
                             
-                            topic_id = topic['topic_id']
-                            
-                            # Если топик уже есть - просто обновляем сиды без захода внутрь
-                            if db.is_torrent_exists(topic_id):
-                                db.update_torrent_seeds(topic_id, topic['seeds'], topic['leeches'])
-                                continue
+                            try:
+                                topic_id = topic['topic_id']
                                 
-                            ru_title, orig_title, year = rutracker.parse_topic_title(topic['title'])
-                            movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
-                            
-                            if movie_id:
-                                logging.info(f"Новая раздача: {ru_title} ({year}) -> ID БД: {movie_id}")
-                                details = rutracker.get_topic_details(topic_id)
+                                # Если топик уже есть - просто обновляем сиды без захода внутрь
+                                if db.is_torrent_exists(topic_id):
+                                    db.update_torrent_seeds(topic_id, topic['seeds'], topic['leeches'])
+                                    continue
+                                    
+                                ru_title, orig_title, year = rutracker.parse_topic_title(topic['title'])
+                                movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
                                 
-                                if details and details.get('magnet'):
-                                    db.insert_torrent(
-                                        topic_id=topic_id,
-                                        movie_id=movie_id,
-                                        topic_title=topic['title'],
-                                        size_gb=round(details['size_gb'], 2),
-                                        quality=details.get('quality', ''),
-                                        file_format='', 
-                                        translation='', 
-                                        magnet_link=details['magnet'],
-                                        seeds=details.get('seeds', topic['seeds']),
-                                        leeches=details.get('leeches', topic['leeches'])
-                                    )
-                                time.sleep(1.5)
+                                if not movie_id:
+                                    # Ищем в TMDB
+                                    search_title = orig_title if orig_title else ru_title
+                                    if search_title:
+                                        logging.info(f"В БД не найдено, ищем в TMDB: {search_title} ({year})")
+                                        try:
+                                            if cat_id == 18:
+                                                tmdb_id = tmdb_client.search_tv(search_title, year)
+                                                if tmdb_id:
+                                                    shifted_id = tmdb_id + 100000000
+                                                    if process_tmdb_tv(shifted_id, db, tmdb_client):
+                                                        movie_id = shifted_id
+                                            else:
+                                                tmdb_id = tmdb_client.search_movie(search_title, year)
+                                                if tmdb_id:
+                                                    if process_tmdb_movie(tmdb_id, db, tmdb_client):
+                                                        movie_id = tmdb_id
+                                        except Exception as e:
+                                            logging.error(f"Ошибка поиска в TMDB для {search_title}: {e}")
+
+                                if movie_id:
+                                    logging.info(f"Добавление раздачи: {ru_title} ({year}) -> ID БД: {movie_id}")
+                                    details = rutracker.get_topic_details(topic_id)
+                                    
+                                    if details and details.get('magnet'):
+                                        db.insert_torrent(
+                                            topic_id=topic_id,
+                                            movie_id=movie_id,
+                                            topic_title=topic['title'],
+                                            size_gb=round(details['size_gb'], 2),
+                                            quality=details.get('quality', ''),
+                                            file_format='', 
+                                            translation='', 
+                                            magnet_link=details['magnet'],
+                                            seeds=details.get('seeds', topic['seeds']),
+                                            leeches=details.get('leeches', topic['leeches'])
+                                        )
+                                    time.sleep(1.5)
+                            except Exception as e:
+                                logging.error(f"Ошибка при обработке топика {topic.get('topic_id', 'Unknown')}: {e}")
+                                time.sleep(2)
                             
             except Exception as e:
                 logging.error(f"Ошибка в главном цикле парсинга Rutracker: {e}")

@@ -99,6 +99,26 @@ class TMDBClient:
         response.raise_for_status()
         return [item['id'] for item in response.json().get('results', [])]
 
+    def search_movie(self, query, year=None):
+        url = f"{self.BASE_URL}/search/movie"
+        params = {"language": "ru-RU", "query": query, "page": 1}
+        if year: params["primary_release_year"] = year
+        if not self.read_token and self.api_key: params["api_key"] = self.api_key
+        response = requests.get(url, headers=self.headers, params=params, timeout=15)
+        response.raise_for_status()
+        results = response.json().get("results", [])
+        return results[0]['id'] if results else None
+
+    def search_tv(self, query, year=None):
+        url = f"{self.BASE_URL}/search/tv"
+        params = {"language": "ru-RU", "query": query, "page": 1}
+        if year: params["first_air_date_year"] = year
+        if not self.read_token and self.api_key: params["api_key"] = self.api_key
+        response = requests.get(url, headers=self.headers, params=params, timeout=15)
+        response.raise_for_status()
+        results = response.json().get("results", [])
+        return results[0]['id'] if results else None
+
     def get_full_poster_url(self, poster_path):
         """
         Формирует полную ссылку на постер.
