@@ -76,10 +76,16 @@
               >Update TMDB catalog</label
             >
           </div>
-          <div class="form-check form-switch mb-4">
+          <div class="form-check form-switch mb-3">
             <input class="form-check-input" type="checkbox" id="runRutracker" />
             <label class="form-check-label" for="runRutracker"
               >Parse Rutracker Torrents</label
+            >
+          </div>
+          <div class="form-check form-switch mb-4">
+            <input class="form-check-input" type="checkbox" id="runNnmclub" />
+            <label class="form-check-label" for="runNnmclub"
+              >Parse NNM-Club Torrents</label
             >
           </div>
           <button
@@ -123,6 +129,13 @@
             ▶ Parse Torrents
           </button>
           <button
+            id="btnStartNnmclub"
+            class="btn btn-sm btn-primary me-2"
+            onclick="parserAction('start_nnmclub')"
+          >
+            ▶ NNM-Club
+          </button>
+          <button
             id="btnStop"
             class="btn btn-sm btn-warning me-2"
             onclick="parserAction('stop')"
@@ -131,7 +144,15 @@
             ■ Stop
           </button>
           <span id="taskStatusBadge" class="badge bg-secondary">Idle</span>
-          <a href="javascript:void(0)" id="btnClearLock" class="text-danger ms-2 text-decoration-none" style="display:none; font-size: 0.85rem;" onclick="parserAction('clear_lock')" title="Force clear stuck flag">✖ Clear Stuck Lock</a>
+          <a
+            href="javascript:void(0)"
+            id="btnClearLock"
+            class="text-danger ms-2 text-decoration-none"
+            style="display: none; font-size: 0.85rem"
+            onclick="parserAction('clear_lock')"
+            title="Force clear stuck flag"
+            >✖ Clear Stuck Lock</a
+          >
         </div>
       </div>
       <div class="card-body">
@@ -176,6 +197,8 @@
       document.getElementById("cronTime").value = data.cron_time || "02:00";
       document.getElementById("runTmdb").checked = data.run_tmdb;
       document.getElementById("runRutracker").checked = data.run_rutracker;
+      document.getElementById("runNnmclub").checked =
+        data.run_nnmclub !== false;
     });
 
   function saveConfig() {
@@ -183,6 +206,7 @@
       cron_time: document.getElementById("cronTime").value,
       run_tmdb: document.getElementById("runTmdb").checked,
       run_rutracker: document.getElementById("runRutracker").checked,
+      run_nnmclub: document.getElementById("runNnmclub").checked,
     };
     fetch("/api/config", {
       method: "POST",
@@ -192,11 +216,16 @@
   }
 
   function parserAction(actionType) {
-    if (actionType === "start_tmdb" || actionType === "start_rutracker") {
+    if (
+      actionType === "start_tmdb" ||
+      actionType === "start_rutracker" ||
+      actionType === "start_nnmclub"
+    ) {
       const payload = {
         cron_time: document.getElementById("cronTime").value,
         run_tmdb: document.getElementById("runTmdb").checked,
         run_rutracker: document.getElementById("runRutracker").checked,
+        run_nnmclub: document.getElementById("runNnmclub").checked,
       };
       // Сначала сохраняем конфиг, затем запускаем
       fetch("/api/config", {
@@ -218,7 +247,6 @@
       });
     }
   }
-
 
   function updateStatus() {
     fetch("/api/status")
@@ -269,11 +297,13 @@
           isRunning || isStopping;
         document.getElementById("btnStartRutracker").disabled =
           isRunning || isStopping;
+        document.getElementById("btnStartNnmclub").disabled =
+          isRunning || isStopping;
         document.getElementById("btnStop").disabled = !isRunning || isStopping;
-          
+
         const btnClear = document.getElementById("btnClearLock");
         if (btnClear) {
-            btnClear.style.display = isStopping ? 'inline' : 'none';
+          btnClear.style.display = isStopping ? "inline" : "none";
         }
 
         // Обновляем статистику, если она пришла

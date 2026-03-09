@@ -16,6 +16,7 @@ from tqdm import tqdm
 from database import MovieDatabase
 from tmdb_client import TMDBClient
 from rutracker_client import RutrackerClient
+from nnmclub_client import NnmclubClient
 DATA_DIR = 'data/'
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -213,7 +214,7 @@ def process_tmdb_tv(tv_id_shifted, db, tmdb_client):
 
 def main():
     parser = argparse.ArgumentParser(description="Movies Parser")
-    parser.add_argument('--mode', choices=['tmdb', 'rutracker', 'cron', 'trends'], required=True, help='Режим работы парсера')
+    parser.add_argument('--mode', choices=['tmdb', 'rutracker', 'nnmclub', 'cron', 'trends'], required=True, help='Режим работы парсера')
     args = parser.parse_args()
 
     config = get_config()
@@ -238,6 +239,7 @@ def main():
 
         run_tmdb = args.mode == 'tmdb' or (args.mode == 'cron' and config.get("run_tmdb", True))
         run_rutracker = args.mode == 'rutracker' or (args.mode == 'cron' and config.get("run_rutracker", True))
+        run_nnmclub = args.mode == 'nnmclub' or (args.mode == 'cron' and config.get("run_nnmclub", True))
         run_trends = args.mode == 'trends' or run_tmdb
 
         # 1.5 Инициализация TMDB клиента
@@ -394,8 +396,8 @@ def main():
                                 topic_id = topic['topic_id']
                                 
                                 # Если топик уже есть - просто обновляем сиды без захода внутрь
-                                if db.is_torrent_exists(topic_id):
-                                    db.update_torrent_seeds(topic_id, topic['seeds'], topic['leeches'])
+                                if db.is_torrent_exists("rutracker", topic_id):
+                                    db.update_torrent_seeds("rutracker", topic_id, topic['seeds'], topic['leeches'])
                                     continue
                                     
                                 ru_title, orig_title, year = rutracker.parse_topic_title(topic['title'])
@@ -427,6 +429,7 @@ def main():
                                     
                                     if details and details.get('magnet'):
                                         db.insert_torrent(
+                                            tracker="rutracker",
                                             topic_id=topic_id,
                                             movie_id=movie_id,
                                             topic_title=topic['title'],
@@ -450,6 +453,90 @@ def main():
                 logging.info("Парсинг Rutracker отменен из-за флага остановки.")
             else:
                 logging.info("Парсинг Rutracker отключен или не запрошен в этом режиме.")
+
+        # --- Парсинг NNM-Club ---
+        if run_nnmclub and not os.path.exists(flag_path):
+            update_progress("Парсинг NNM-Club", 0, 100)
+            nnm = NnmclubClient()
+            logging.info("Авторизация отключена: парсинг в гостевом режиме.")
+            NNM_FORUMS = [
+                # Горячие новинки
+                218, 954,
+                # Классика кино и Старые фильмы до 90-х
+                319, 885, 910, 912,
+                # Зарубежное кино
+                225, 227, 1296, 1299, 682, 884
+            ]
+            NNM_TV_FORUMS = [
+                # Зарубежные сериалы
+                1344, 779, 1288, 787, 1141, 777, 786, 776, 785, 775, 
+                1265, 1242, 1140, 782, 773, 1142, 772, 771, 783, 1144, 
+                804, 1290, 1300, 784, 774, 922, 770, 780
+            ]
+            all_nnm_forums = NNM_FORUMS + NNM_TV_FORUMS
+            
+            for idx, f_id in enumerate(all_nnm_forums):
+                if os.path.exists(flag_path): break
+                update_progress(f"NNM-Club: Форум {f_id}", idx, len(all_nnm_forums))
+                
+                try:
+                    topics = nnm.get_topics_from_forum(f_id, pages=2)
+                except Exception as e:
+                    logging.error(f"Ошибка при получении топиков NNM-Club форума {f_id}: {e}")
+                    time.sleep(2)
+                    continue
+                    
+                for topic in topics:
+                    if os.path.exists(flag_path): break
+                    
+                    try:
+                        topic_id = topic['topic_id']
+                        if db.is_torrent_exists("nnmclub", topic_id):
+                            db.update_torrent_seeds("nnmclub", topic_id, topic['seeds'], topic['leeches'])
+                            continue
+                            
+                        ru_title, orig_title, year = nnm.parse_topic_title(topic['title'])
+                        movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
+                        
+                        if not movie_id:
+                            # Ищем в TMDB
+                            search_title = orig_title if orig_title else ru_title
+                            if search_title:
+                                logging.info(f"NNM В БД не найдено, ищем в TMDB: {search_title} ({year})")
+                                try:
+                                    if f_id in NNM_TV_FORUMS:
+                                        tmdb_id = tmdb_client.search_tv(search_title, year)
+                                        if tmdb_id:
+                                            shifted_id = tmdb_id + 100000000
+                                            if process_tmdb_tv(shifted_id, db, tmdb_client):
+                                                movie_id = shifted_id
+                                    else:
+                                        tmdb_id = tmdb_client.search_movie(search_title, year)
+                                        if tmdb_id:
+                                            if process_tmdb_movie(tmdb_id, db, tmdb_client):
+                                                movie_id = tmdb_id
+                                except Exception as e:
+                                    logging.error(f"NNM Ошибка поиска в TMDB для {search_title}: {e}")
+
+                        if movie_id:
+                            logging.info(f"NNM Новая раздача: {ru_title} ({year}) -> ID БД: {movie_id}")
+                            details = nnm.get_topic_details(topic_id)
+                            if details:
+                                db.insert_torrent(
+                                    tracker="nnmclub", topic_id=topic_id, movie_id=movie_id,
+                                    topic_title=topic['title'], size_gb=round(topic.get('size_gb', details.get('size_gb', 0)), 2),
+                                    quality=details.get('quality', ''), file_format=details.get('file_format', ''), translation=details.get('translation', ''),
+                                    magnet_link=details.get('magnet', ''), seeds=topic['seeds'], leeches=topic['leeches']
+                                )
+                        time.sleep(1)
+                    except Exception as e:
+                        logging.error(f"Ошибка на NNM-Club при обработке топика {topic.get('topic_id', 'Unknown')}: {e}")
+                        time.sleep(2)
+        else:
+            if run_nnmclub:
+                logging.info("Парсинг NNM-Club отменен из-за флага остановки.")
+            else:
+                logging.info("Парсинг NNM-Club отключен или не запрошен в этом режиме.")
 
     finally:
         # 4. Архивация базы данных всегда выполняется

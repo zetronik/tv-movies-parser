@@ -33,7 +33,8 @@ class MovieDatabase:
         torrents_query = """
         CREATE TABLE IF NOT EXISTS torrents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            topic_id INTEGER UNIQUE,
+            tracker TEXT,
+            topic_id INTEGER,
             movie_id INTEGER,
             topic_title TEXT,
             size_gb REAL,
@@ -43,7 +44,7 @@ class MovieDatabase:
             magnet_link TEXT,
             seeds INTEGER,
             leeches INTEGER,
-            UNIQUE(movie_id, magnet_link),
+            UNIQUE(tracker, topic_id),
             FOREIGN KEY(movie_id) REFERENCES movies(id)
         )
         """
@@ -69,13 +70,22 @@ class MovieDatabase:
                     conn.execute("ALTER TABLE movies ADD COLUMN media_type TEXT DEFAULT 'movie'")
                     conn.commit()
 
-                # Migration for torrents table to add topic_id
+                # Migration for torrents table to add tracker
                 cursor = conn.execute("PRAGMA table_info(torrents)")
                 columns = [info[1] for info in cursor.fetchall()]
-                if 'topic_id' not in columns:
+                if 'tracker' not in columns:
                     conn.execute("DROP TABLE torrents")
                     conn.commit()
                     self._create_tables()
+
+                # Безопасное создание индексов для ускорения поиска на клиенте
+                indexes_query = """
+                CREATE INDEX IF NOT EXISTS idx_movies_release_date ON movies(release_date);
+                CREATE INDEX IF NOT EXISTS idx_torrents_movie_id ON torrents(movie_id);
+                CREATE INDEX IF NOT EXISTS idx_movies_media_type ON movies(media_type);
+                """
+                conn.executescript(indexes_query)
+                conn.commit()
 
     def get_existing_ids(self):
         """Возвращает множество ID фильмов, которые уже есть в базе."""
@@ -123,28 +133,28 @@ class MovieDatabase:
                 conn.execute(query, movie_data)
                 conn.commit()
 
-    def insert_torrent(self, topic_id, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches):
+    def insert_torrent(self, tracker, topic_id, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches):
         query = """
         INSERT OR IGNORE INTO torrents (
-            topic_id, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches
+            tracker, topic_id, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         with db_lock:
             with self.get_connection() as conn:
-                conn.execute(query, (topic_id, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches))
+                conn.execute(query, (tracker, topic_id, movie_id, topic_title, size_gb, quality, file_format, translation, magnet_link, seeds, leeches))
                 conn.commit()
 
-    def is_torrent_exists(self, topic_id):
-        query = "SELECT 1 FROM torrents WHERE topic_id = ?"
+    def is_torrent_exists(self, tracker, topic_id):
+        query = "SELECT 1 FROM torrents WHERE tracker = ? AND topic_id = ?"
         with self.get_connection() as conn:
-            return conn.execute(query, (topic_id,)).fetchone() is not None
+            return conn.execute(query, (tracker, topic_id)).fetchone() is not None
 
-    def update_torrent_seeds(self, topic_id, seeds, leeches):
-        query = "UPDATE torrents SET seeds = ?, leeches = ? WHERE topic_id = ?"
+    def update_torrent_seeds(self, tracker, topic_id, seeds, leeches):
+        query = "UPDATE torrents SET seeds = ?, leeches = ? WHERE tracker = ? AND topic_id = ?"
         with db_lock:
             with self.get_connection() as conn:
-                conn.execute(query, (seeds, leeches, topic_id))
+                conn.execute(query, (seeds, leeches, tracker, topic_id))
                 conn.commit()
 
     def find_movie_by_title_and_year(self, title, original_title, year):

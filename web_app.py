@@ -23,7 +23,7 @@ def get_parser_config():
         with open(os.path.join(DATA_DIR, 'parser_config.json'), 'r', encoding='utf-8') as f:
             return json.load(f)
     except:
-        return {"run_tmdb": True, "run_rutracker": True, "cron_time": "02:00"}
+        return {"run_tmdb": True, "run_rutracker": True, "run_nnmclub": True, "cron_time": "02:00"}
 
 def save_parser_config(data):
     with open(os.path.join(DATA_DIR, 'parser_config.json'), 'w', encoding='utf-8') as f:
@@ -258,6 +258,9 @@ def api_action():
         return jsonify({"status": "started"})
     elif action == 'start_rutracker':
         start_parser_task('rutracker')
+        return jsonify({"status": "started"})
+    elif action == 'start_nnmclub':
+        start_parser_task('nnmclub')
         return jsonify({"status": "started"})
     elif action == 'stop':
         # БЕЗУСЛОВНО создаем флаг остановки, даже если процесс - "сирота"
