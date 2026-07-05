@@ -1,8 +1,7 @@
 import os
 import requests
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 import re
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -14,6 +13,7 @@ class RutrackerClient:
         })
         self.login_username = os.environ.get("RUTRACKER_LOGIN")
         self.login_password = os.environ.get("RUTRACKER_PASSWORD")
+        self.base_domain = "https://rutracker.org"
 
     def login(self):
         """Авторизация на Rutracker"""
@@ -26,182 +26,21 @@ class RutrackerClient:
             "login_password": self.login_password,
             "login": "Вход"
         }
-        
-        response = self.session.post(url, data=data)
+
+        response = self.session.post(url, data=data, timeout=30)
         response.raise_for_status()
-        
+
         if 'bb_session' in self.session.cookies or 'profile.php?mode=viewprofile' in response.text:
             return True
         return False
 
-    def search_movie(self, title, original_title, year):
-        """Поиск фильма на трекере по оригинальному названию и году"""
-        url = "https://rutracker.org/forum/tracker.php"
-        nm = f"{original_title} {year}"
-        params = {
-            "nm": nm
-        }
-        
-        response = self.session.get(url, params=params)
+    def fetch_page(self, url):
+        """Скачивает сырой HTML страницы для передачи в LLM."""
+        response = self.session.get(url, timeout=30)
         response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, "lxml")
-        rows = soup.find_all("tr", class_="tCenter")
-        
-        results = []
-        
-        for row in rows:
-            title_tag = row.find("a", class_="tLink")
-            if not title_tag:
-                 title_tag = row.find("a", class_="tt-text")
-            
-            if not title_tag:
-                continue
-                
-            topic_title = title_tag.text.strip()
-            topic_url = f"https://rutracker.org/forum/{title_tag['href']}"
-            topic_id = title_tag['href'].split("=")[-1]
-            
-            # Извлечение сидов
-            seeds = 0
-            seed_elem = row.find(class_=re.compile(r'seedmed')) or row.find(title="Сиды")
-            if seed_elem:
-                seed_digits = re.sub(r'\D', '', seed_elem.text)
-                if seed_digits:
-                    seeds = int(seed_digits)
-            
-            # Извлечение личей
-            leeches = 0
-            leech_elem = row.find(class_=re.compile(r'leechmed')) or row.find(title="Личи")
-            if leech_elem:
-                leech_digits = re.sub(r'\D', '', leech_elem.text)
-                if leech_digits:
-                    leeches = int(leech_digits)
-            
-            results.append({
-                "topic_id": topic_id,
-                "topic_url": topic_url,
-                "topic_title": topic_title,
-                "seeds": seeds,
-                "leeches": leeches
-            })
-            
-        return results
+        return response.text
 
-    def _extract_meta(self, soup, keywords):
-        if isinstance(keywords, str):
-            keywords = [keywords]
-        
-        # Ищем тег, содержащий любой из синонимов (без учета регистра)
-        tag = soup.find(lambda t: getattr(t, 'name', None) in ['span', 'b', 'strong'] and t.text and any(k.lower() in t.text.lower() for k in keywords))
-        
-        if not tag:
-            return None
-        
-        value = ""
-        # Собираем весь текст после найденного тега до первого переноса строки <br>
-        for sibling in tag.next_siblings:
-            if getattr(sibling, 'name', None) == 'br':
-                break
-            # Останавливаемся, если началось следующее поле (новый тег b, span или strong)
-            if getattr(sibling, 'name', None) in ['span', 'b', 'strong']:
-                break
-            if isinstance(sibling, str):
-                value += sibling
-            else:
-                value += sibling.get_text()
-                
-        # Очищаем результат от двоеточий, лишних пробелов и неразрывных пробелов
-        clean_value = value.strip(' :\\n\\r\\t\\xa0')
-        return clean_value if clean_value else None
-
-    def get_forums_from_category(self, category_id):
-        """Собирает ID всех подразделов (форумов) из указанной категории (например, Кино = 2)."""
-        url = f"https://rutracker.org/forum/index.php?c={category_id}"
-        response = self.session.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'lxml')
-        
-        forum_ids = []
-        # Ищем все ссылки на форумы (подразделы)
-        for a_tag in soup.select('a'):
-            href = a_tag.get('href')
-            if href and 'viewforum.php?f=' in href:
-                forum_id = href.split('f=')[-1]
-                forum_ids.append(forum_id)
-        return list(set(forum_ids)) # Убираем дубликаты
-
-    def get_topic_details(self, topic_id):
-        """Скачивает страницу топика и возвращает сырой HTML и URL."""
-        url = f"https://rutracker.org/forum/viewtopic.php?t={topic_id}"
-        response = self.session.get(url)
-        response.raise_for_status()
-        return {
-            'html': response.text,
-            'url': url
-        }
-
-    def parse_topic_title(self, title):
-        """
-        Извлекает русское название, оригинальное название и год из стандартного заголовка Rutracker.
-        Пример: Зеленая миля / The Green Mile (Фрэнк Дарабонт) [1999, США, BDRip]
-        """
-        # Регулярное выражение для поиска названий и года в квадратных скобках
-        match = re.search(r'^(.+?)(?:\s+/\s+(.+?))?(?:\s+\(.*\))?\s+\[(\d{4})', title)
-        if match:
-            ru_title = match.group(1).strip()
-            # Если оригинального названия нет, group(2) будет None
-            orig_title = match.group(2).strip() if match.group(2) else ""
-            year = match.group(3)
-            return ru_title, orig_title, year
-        return None, None, None
-
-    def get_topics_from_forum(self, forum_id, pages=1):
-        topics = []
-        for page in range(pages):
-            start = page * 50
-            url = f"https://rutracker.org/forum/viewforum.php?f={forum_id}&start={start}"
-            response = self.session.get(url)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'lxml')
-            
-            # Находим разделитель "Темы"
-            separator = soup.find(lambda tag: tag.name == 'td' and 'topicSep' in tag.get('class', []) and 'Темы' in tag.text)
-            
-            if separator:
-                trs = separator.parent.find_next_siblings('tr', class_='hl-tr')
-            else:
-                trs = soup.select('tr.hl-tr')
-                
-            for row in trs:
-                a_tag = row.select_one('a.tt-text')
-                if not a_tag: continue
-                
-                title = a_tag.text.strip()
-                
-                # Фильтрация DVD форматов
-                if re.search(r'DVD(-?Video|5|9)', title, re.IGNORECASE):
-                    continue
-                    
-                href = a_tag.get('href')
-                if href and 'viewtopic.php?t=' in href:
-                    topic_id = int(href.split('t=')[-1])
-                    
-                    seeds, leeches = 0, 0
-                    seed_tag = row.find(class_=re.compile(r'seedmed')) or row.find(title="Сиды")
-                    if seed_tag:
-                        s_text = re.sub(r'\D', '', seed_tag.text)
-                        if s_text: seeds = int(s_text)
-                        
-                    leech_tag = row.find(class_=re.compile(r'leechmed')) or row.find(title="Личи")
-                    if leech_tag:
-                        l_text = re.sub(r'\D', '', leech_tag.text)
-                        if l_text: leeches = int(l_text)
-                    
-                    topics.append({
-                        'topic_id': topic_id,
-                        'title': title,
-                        'seeds': seeds,
-                        'leeches': leeches
-                    })
-        return topics
+    def extract_topic_id(self, url):
+        """Извлекает ID раздачи из URL для проверки дубликатов в базе."""
+        match = re.search(r't=(\d+)', url)
+        return int(match.group(1)) if match else None

@@ -2,6 +2,7 @@ import sqlite3
 import threading
 
 db_lock = threading.Lock()
+
 class MovieDatabase:
     def __init__(self, db_name="data/movies.db"):
         self.db_name = db_name
@@ -29,7 +30,7 @@ class MovieDatabase:
             media_type TEXT DEFAULT 'movie'
         )
         """
-        
+
         torrents_query = """
         CREATE TABLE IF NOT EXISTS torrents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,10 +56,23 @@ class MovieDatabase:
             FOREIGN KEY(movie_id) REFERENCES movies(id)
         )
         """
+
+        # Новая таблица для сохранения структуры трекеров (память LLM)
+        tracker_topology_query = """
+        CREATE TABLE IF NOT EXISTS tracker_topology (
+            tracker_name TEXT PRIMARY KEY,
+            movies_url TEXT,
+            series_url TEXT,
+            cartoons_url TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+
         with self.get_connection() as conn:
             conn.execute(movies_query)
             conn.execute(torrents_query)
             conn.execute(now_playing_query)
+            conn.execute(tracker_topology_query)
             conn.commit()
 
     def _run_migrations(self):
@@ -164,28 +178,28 @@ class MovieDatabase:
         """
         if not year:
             return None
-            
+
         query = """
-        SELECT id FROM movies 
-        WHERE (title LIKE ? OR original_title LIKE ?) 
-        AND release_date LIKE ? 
+        SELECT id FROM movies
+        WHERE (title LIKE ? OR original_title LIKE ?)
+        AND release_date LIKE ?
         LIMIT 1
         """
         # Ищем год в начале release_date (формат YYYY-MM-DD)
         year_pattern = f"{year}-%"
-        
+
         with self.get_connection() as conn:
             # Пробуем найти по оригинальному названию, если оно есть
             if original_title:
                 cursor = conn.execute(query, (f"%{original_title}%", f"%{original_title}%", year_pattern))
                 result = cursor.fetchone()
                 if result: return result[0]
-                
+
             # Пробуем найти по русскому названию
             cursor = conn.execute(query, (f"%{title}%", f"%{title}%", year_pattern))
             result = cursor.fetchone()
             if result: return result[0]
-            
+
         return None
 
     def update_now_playing_list(self, movie_ids):
@@ -195,4 +209,41 @@ class MovieDatabase:
                 conn.execute("DELETE FROM now_playing")
                 for mid in movie_ids:
                     conn.execute("INSERT OR IGNORE INTO now_playing (movie_id) VALUES (?)", (mid,))
+                conn.commit()
+
+    # --- Новые методы для управления картой структуры трекеров (Tracker Topology) ---
+
+    def get_tracker_topology(self, tracker_name: str):
+        """Получает структуру (URL разделов) для конкретного трекера."""
+        query = "SELECT movies_url, series_url, cartoons_url FROM tracker_topology WHERE tracker_name = ?"
+        with self.get_connection() as conn:
+            cursor = conn.execute(query, (tracker_name,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'movies_url': row[0],
+                    'series_url': row[1],
+                    'cartoons_url': row[2]
+                }
+            return None
+
+    def save_tracker_topology(self, tracker_name: str, topology_data: dict):
+        """Сохраняет или обновляет структуру ссылок разделов трекера."""
+        query = """
+        INSERT INTO tracker_topology (tracker_name, movies_url, series_url, cartoons_url)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(tracker_name) DO UPDATE SET
+            movies_url = excluded.movies_url,
+            series_url = excluded.series_url,
+            cartoons_url = excluded.cartoons_url,
+            updated_at = CURRENT_TIMESTAMP
+        """
+        with db_lock:
+            with self.get_connection() as conn:
+                conn.execute(query, (
+                    tracker_name,
+                    topology_data.get('movies_url'),
+                    topology_data.get('series_url'),
+                    topology_data.get('cartoons_url')
+                ))
                 conn.commit()
