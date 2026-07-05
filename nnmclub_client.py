@@ -61,38 +61,11 @@ class NnmclubClient:
                     topics.append({'topic_id': topic_id, 'title': title, 'seeds': seeds, 'leeches': leeches, 'size_gb': size_gb})
         return topics
     def get_topic_details(self, topic_id):
+        """Скачивает страницу топика и возвращает сырой HTML и URL."""
         url = f"{self.base_url}/viewtopic.php?t={topic_id}"
         res = self.session.get(url)
-        soup = BeautifulSoup(res.text, 'lxml')
-        
-        magnet_tag = soup.find('a', href=re.compile(r'^magnet:\?xt='))
-        magnet = magnet_tag['href'] if magnet_tag else ""
-        
-        size_text = ""
-        for span in soup.select('span.genmed b'):
-            if 'GB' in span.text or 'MB' in span.text or 'ГБ' in span.text or 'МБ' in span.text:
-                size_text = span.text
-                break
-        
-        size_gb = 0.0
-        if size_text:
-            nums = re.findall(r'[\d\.]+', size_text.replace(',', '.'))
-            if nums:
-                val = float(nums[0])
-                size_gb = val if 'GB' in size_text or 'ГБ' in size_text else val / 1024
-
-        def get_text_after(label_pattern):
-            tag = soup.find(string=re.compile(label_pattern))
-            if tag and tag.parent:
-                cur = tag.parent
-                if cur.name in ('span', 'b', 'strong'):
-                    nxt = cur.next_sibling
-                    if nxt and isinstance(nxt, str):
-                        return nxt.strip().lstrip(':').strip()
-            return ""
-
-        quality = get_text_after(r'(?i)качество( видео)?')
-        translation = get_text_after(r'(?i)перевод')
-        file_format = get_text_after(r'(?i)формат')
-                
-        return {'magnet': magnet, 'size_gb': size_gb, 'quality': quality, 'file_format': file_format, 'translation': translation}
+        res.raise_for_status()
+        return {
+            'html': res.text,
+            'url': url
+        }

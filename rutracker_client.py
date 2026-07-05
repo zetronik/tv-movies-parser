@@ -132,46 +132,14 @@ class RutrackerClient:
         return list(set(forum_ids)) # Убираем дубликаты
 
     def get_topic_details(self, topic_id):
-        """Заходит в топик и собирает магнит, сиды, личи и размер."""
+        """Скачивает страницу топика и возвращает сырой HTML и URL."""
         url = f"https://rutracker.org/forum/viewtopic.php?t={topic_id}"
         response = self.session.get(url)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'lxml')
-        
-        details = {
-            'magnet': None, 'size_gb': 0.0, 'seeds': 0, 'leeches': 0,
-            'quality': None, 'format': None, 'translation': None
+        return {
+            'html': response.text,
+            'url': url
         }
-        
-        # Магнет ссылка
-        magnet_a = soup.find("a", class_="magnet-link")
-        if magnet_a: details['magnet'] = magnet_a.get('href')
-        
-        # Сиды и Личи (на рутрекере хранятся в span с классами seed и leech)
-        seed_span = soup.find("span", class_="seed")
-        if seed_span: details['seeds'] = int(re.sub(r'[^0-9]', '', seed_span.text) or 0)
-        
-        leech_span = soup.find("span", class_="leech")
-        if leech_span: details['leeches'] = int(re.sub(r'[^0-9]', '', leech_span.text) or 0)
-            
-        # Размер файла
-        size_span = soup.find("span", id="tor-size-humn")
-        if size_span:
-            raw_size = size_span.text.replace('\xa0', ' ').replace('&nbsp;', ' ').strip()
-            match = re.search(r'([\d\.]+)\s*([A-Za-zА-Яа-я]+)', raw_size)
-            if match:
-                val = float(match.group(1))
-                unit = match.group(2).upper()
-                if unit in ['GB', 'ГБ']: details['size_gb'] = val
-                elif unit in ['MB', 'МБ']: details['size_gb'] = val / 1024.0
-                
-        # Качество берем из заголовка как резерв (последнее значение в скобках [])
-        title_tag = soup.select_one('h1.maintitle a')
-        if title_tag:
-            q_match = re.search(r'\[[^\]]+,\s*([^,\]]+)\]', title_tag.text)
-            if q_match: details['quality'] = q_match.group(1).strip()
-            
-        return details
 
     def parse_topic_title(self, title):
         """

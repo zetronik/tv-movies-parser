@@ -12,6 +12,7 @@ progress.json
 parser.log
 stop.flag
 parser_config.json
+.agents
 
 # Игнорируем секреты
 .env

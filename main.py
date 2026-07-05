@@ -1,5 +1,6 @@
 import sys
 import threading
+import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 import hashlib
@@ -17,6 +18,9 @@ from database import MovieDatabase
 from tmdb_client import TMDBClient
 from rutracker_client import RutrackerClient
 from nnmclub_client import NnmclubClient
+from content_cleaner import clean_html_to_markdown
+from llm_parser import extract_torrent_data
+
 DATA_DIR = 'data/'
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -28,6 +32,112 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     encoding='utf-8'
 )
+
+html_queue = queue.Queue()
+db_lock = threading.Lock()
+topic_metadata = {}
+metadata_lock = threading.Lock()
+
+def producer_task(url, tracker_type, client):
+    """Скачивает HTML-код топика, очищает его и добавляет в очередь html_queue."""
+    import random
+    # Случайная задержка для имитации естественного поведения браузера
+    # и предотвращения блокировки по rate-limit (503 от NNM-Club)
+    delay_min = float(os.environ.get("NNMCLUB_REQUEST_DELAY_MIN", 1.0))
+    delay_max = float(os.environ.get("NNMCLUB_REQUEST_DELAY_MAX", 4.0))
+    time.sleep(random.uniform(delay_min, delay_max))
+    try:
+        topic_id_match = re.search(r't=(\d+)', url)
+        if not topic_id_match:
+            logging.error(f"Не удалось извлечь topic_id из URL: {url}")
+            return
+        topic_id = int(topic_id_match.group(1))
+        
+        details = client.get_topic_details(topic_id)
+        if details and 'html' in details:
+            markdown_text = clean_html_to_markdown(details['html'])
+            html_queue.put((url, markdown_text))
+            logging.info(f"Producer: добавлен {url} в очередь")
+    except Exception as e:
+        logging.error(f"Ошибка в Producer для {url}: {e}")
+
+def consumer_loop(db, tmdb_client, nnm_tv_forums):
+    """В бесконечном цикле обрабатывает очередь html_queue и сохраняет данные в БД."""
+    while True:
+        item = html_queue.get()
+        if item is None:
+            html_queue.task_done()
+            break
+        
+        url, markdown_text = item
+        try:
+            extracted = extract_torrent_data(markdown_text)
+            if not extracted:
+                logging.warning(f"LLM не смогла извлечь данные для {url}")
+                continue
+            
+            with metadata_lock:
+                meta = topic_metadata.get(url)
+            
+            if not meta:
+                logging.warning(f"Метаданные для URL не найдены: {url}")
+                continue
+            
+            ru_title = extracted.ru_title
+            orig_title = extracted.orig_title
+            year = str(extracted.year)
+            
+            # Поиск фильма в локальной БД
+            movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
+            
+            if not movie_id:
+                search_title = orig_title if orig_title else ru_title
+                if search_title:
+                    logging.info(f"Фильм не найден в БД. Поиск в TMDB: {search_title} ({year})")
+                    try:
+                        is_tv = False
+                        if meta['tracker'] == 'rutracker' and meta['cat_id'] == 18:
+                            is_tv = True
+                        elif meta['tracker'] == 'nnmclub' and meta['cat_id'] in nnm_tv_forums:
+                            is_tv = True
+                        
+                        if is_tv:
+                            tmdb_id = tmdb_client.search_tv(search_title, year)
+                            if tmdb_id:
+                                shifted_id = tmdb_id + 100000000
+                                if process_tmdb_tv(shifted_id, db, tmdb_client):
+                                    movie_id = shifted_id
+                        else:
+                            tmdb_id = tmdb_client.search_movie(search_title, year)
+                            if tmdb_id:
+                                if process_tmdb_movie(tmdb_id, db, tmdb_client):
+                                    movie_id = tmdb_id
+                    except Exception as e:
+                        logging.error(f"Ошибка TMDB поиска для {search_title} ({year}): {e}")
+            
+            if movie_id:
+                logging.info(f"Запись раздачи в БД: {ru_title} ({year}) -> ID фильма: {movie_id}")
+                with db_lock:
+                    db.insert_torrent(
+                        tracker=meta['tracker'],
+                        topic_id=meta['topic_id'],
+                        movie_id=movie_id,
+                        topic_title=meta['topic_title'],
+                        size_gb=round(extracted.size_gb, 2),
+                        quality=extracted.quality,
+                        file_format='',
+                        translation='',
+                        magnet_link=extracted.magnet_link,
+                        seeds=meta['seeds'],
+                        leeches=meta['leeches']
+                    )
+            else:
+                logging.warning(f"Не удалось привязать раздачу к фильму: {ru_title} ({year})")
+                
+        except Exception as e:
+            logging.error(f"Ошибка в Consumer при обработке {url}: {e}")
+        finally:
+            html_queue.task_done()
 
 def update_progress(task_name, current, total):
     try:
@@ -81,10 +191,8 @@ def create_zip(db_name="movies.db"):
         temp_zip = os.path.join(DATA_DIR, "movies_temp.zip")
         final_zip = os.path.join(DATA_DIR, "movies.zip")
         with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
-            # Кладем внутрь архива сам файл (чтобы внутри не было пути DATA_DIR)
             zipf.write(db_name, arcname=os.path.basename(db_name))
         
-        # Безопасная замена файла (с попытками, если файл сейчас скачивают)
         for _ in range(5):
             try:
                 os.replace(temp_zip, final_zip)
@@ -92,25 +200,22 @@ def create_zip(db_name="movies.db"):
             except PermissionError:
                 time.sleep(2)
                 
-        logging.info("База данных успешно сжата в movies.zip")
+        logging.info("База данных успешно сжата in movies.zip")
         
         final_zip = os.path.join(DATA_DIR, "movies.zip")
         md5_file = os.path.join(DATA_DIR, "movies.md5")
         
-        # Генерируем MD5 хеш
         md5_hash = hashlib.md5()
         with open(final_zip, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):
                 md5_hash.update(chunk)
         hash_str = md5_hash.hexdigest()
         
-        # Сохраняем в файл
         with open(md5_file, "w") as f:
             f.write(hash_str)
             
         logging.info(f"Сгенерирован MD5 хеш: {hash_str}")
         
-        # Загружаем в облако оба файла
         upload_to_r2(final_zip)
         upload_to_r2(md5_file)
     except Exception as e:
@@ -129,20 +234,17 @@ def process_tmdb_movie(movie_id, db, tmdb_client):
         
         full_poster_url = tmdb_client.get_full_poster_url(poster_path)
         
-        # Извлечение данных
         genres = ", ".join([g.get("name", "") for g in movie.get("genres", []) if g.get("name")])
         countries = ", ".join([c.get("name", "") for c in movie.get("production_countries", []) if c.get("name")])
         
         credits = movie.get("credits", {})
         
-        # Режиссеры
         directors = ", ".join([
             crew_member.get("name", "") 
             for crew_member in credits.get("crew", []) 
             if crew_member.get("job") == "Director" and crew_member.get("name")
         ])
         
-        # Актёры
         actors = ", ".join([
             cast_member.get("name", "") 
             for cast_member in credits.get("cast", [])[:10] 
@@ -189,7 +291,6 @@ def process_tmdb_tv(tv_id_shifted, db, tmdb_client):
         poster_path = tv.get("poster_path")
         full_poster_url = tmdb_client.get_full_poster_url(poster_path)
         
-        # Принудительно добавляем тег "Сериал", чтобы клиент Flutter его распознал
         genres_list = [g.get("name", "") for g in tv.get("genres", []) if g.get("name")]
         if "Сериал" not in genres_list: genres_list.append("Сериал")
         genres = ", ".join(genres_list)
@@ -229,7 +330,6 @@ def main():
             pass
 
     try:
-        # 1. Инициализация БД
         try:
             db = MovieDatabase()
             logging.info("[1/3] База данных инициализирована.")
@@ -242,13 +342,11 @@ def main():
         run_nnmclub = args.mode == 'nnmclub' or (args.mode == 'cron' and config.get("run_nnmclub", True))
         run_trends = args.mode == 'trends' or run_tmdb
 
-        # 1.5 Инициализация TMDB клиента
         tmdb_client = TMDBClient()
         if not tmdb_client.read_token and not tmdb_client.api_key:
             logging.error("Ошибка: API ключи TMDB не найдены в файле .env. Пожалуйста, заполните их.")
             sys.exit(1)
 
-        # 2. Обработка TMDB (полная база)
         if run_tmdb:
             logging.info("[2/3] Получение списков ID фильмов и сериалов...")
             try:
@@ -267,7 +365,6 @@ def main():
                 logging.error(f"Ошибка при получении списков ID: {e}")
                 sys.exit(1)
 
-            # Обработка TMDB
             if ids_to_fetch:
                 ids_to_process = list(ids_to_fetch)
                 logging.info(f"[3/3] Начинаем загрузку TMDB (всего {len(ids_to_process)} новых ID)...")
@@ -288,7 +385,6 @@ def main():
                     active_tasks = set()
                     id_iterator = iter(ids_to_process)
                     
-                    # Пул начинается с небольшого запаса задач
                     for _ in range(max_workers * 2):
                         try:
                             item_id = next(id_iterator)
@@ -303,10 +399,9 @@ def main():
                                 try:
                                     executor.shutdown(wait=False, cancel_futures=True)
                                 except TypeError:
-                                    executor.shutdown(wait=False) # Для старых версий Python
+                                    executor.shutdown(wait=False)
                                 break
                             
-                            # Ждем завершения хотя бы одной задачи, или просыпаемся раз в секунду
                             done, active_tasks = concurrent.futures.wait(active_tasks, timeout=1.0, return_when=concurrent.futures.FIRST_COMPLETED)
                             
                             for future in done:
@@ -319,7 +414,6 @@ def main():
                                 pbar.update(1)
                                 update_progress("Парсинг TMDB", pbar.n, total_tmdb)
                                 
-                                # Добавляем новую задачу в пул взамен завершенной
                                 try:
                                     next_item_id = next(id_iterator)
                                     active_tasks.add(executor.submit(process_item, next_item_id, db, tmdb_client))
@@ -331,7 +425,6 @@ def main():
             if args.mode != 'trends':
                 logging.info("Парсинг TMDB отключен (работает другой режим).")
 
-        # 2.5 Обработка трендов "Сейчас смотрят"
         if run_trends:
             if not os.path.exists(flag_path):
                 update_progress("Обновление 'Сейчас смотрят'", 0, 100)
@@ -340,11 +433,9 @@ def main():
                     now_playing_m = tmdb_client.get_now_playing_movies()
                     trending_tv = tmdb_client.get_trending_tv_shows()
                     
-                    # Сдвигаем ID сериалов
                     shifted_tv_ids = [tid + 100000000 for tid in trending_tv]
                     all_trending_ids = now_playing_m + shifted_tv_ids
                     
-                    # Проверяем, есть ли эти фильмы в нашей базе, если нет - докачиваем
                     local_ids = db.get_existing_ids()
                     missing_ids = [mid for mid in all_trending_ids if mid not in local_ids]
                     
@@ -356,11 +447,30 @@ def main():
                             else:
                                 process_tmdb_movie(mid, db, tmdb_client)
                                 
-                    # Обновляем таблицу
                     db.update_now_playing_list(all_trending_ids)
                     logging.info(f"Раздел 'Сейчас смотрят' обновлен. Всего: {len(all_trending_ids)} элементов.")
                 except Exception as e:
                     logging.error(f"Ошибка при обновлении 'Сейчас смотрят': {e}")
+
+        # Инициализация пулов потоков для Producer-Consumer архитектуры
+        # Параметры читаются из .env:
+        # PRODUCER_MAX_WORKERS — кол-во параллельных потоков (дефолт: 3)
+        # NNMCLUB_REQUEST_DELAY_MIN/MAX — диапазон задержки в секундах (дефолт: 1.0–4.0)
+        _max_workers = int(os.environ.get("PRODUCER_MAX_WORKERS", 3))
+        producers_executor = ThreadPoolExecutor(max_workers=_max_workers)
+        consumers_executor = ThreadPoolExecutor(max_workers=1)
+        
+        producer_futures = []
+        
+        NNM_TV_FORUMS = [
+            # Зарубежные сериалы
+            1344, 779, 1288, 787, 1141, 777, 786, 776, 785, 775, 
+            1265, 1242, 1140, 782, 773, 1142, 772, 771, 783, 1144, 
+            804, 1290, 1300, 784, 774, 922, 770, 780
+        ]
+        
+        # Запуск фонового потребителя (Consumer)
+        consumers_executor.submit(consumer_loop, db, tmdb_client, NNM_TV_FORUMS)
 
         # 3. Полный прогон парсера Рутрекера
         if run_rutracker and not os.path.exists(flag_path):
@@ -381,7 +491,6 @@ def main():
                         if os.path.exists(flag_path): break
                         logging.info(f"Сканирование подраздела f={forum_id}...")
                         
-                        # Смотрим первые 2 страницы (свежие раздачи)
                         try:
                             topics = rutracker.get_topics_from_forum(forum_id, pages=2)
                         except Exception as e:
@@ -392,59 +501,27 @@ def main():
                         for topic in topics:
                             if os.path.exists(flag_path): break
                             
-                            try:
-                                topic_id = topic['topic_id']
-                                
-                                # Если топик уже есть - просто обновляем сиды без захода внутрь
-                                if db.is_torrent_exists("rutracker", topic_id):
-                                    db.update_torrent_seeds("rutracker", topic_id, topic['seeds'], topic['leeches'])
-                                    continue
-                                    
-                                ru_title, orig_title, year = rutracker.parse_topic_title(topic['title'])
-                                movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
-                                
-                                if not movie_id:
-                                    # Ищем в TMDB
-                                    search_title = orig_title if orig_title else ru_title
-                                    if search_title:
-                                        logging.info(f"В БД не найдено, ищем в TMDB: {search_title} ({year})")
-                                        try:
-                                            if cat_id == 18:
-                                                tmdb_id = tmdb_client.search_tv(search_title, year)
-                                                if tmdb_id:
-                                                    shifted_id = tmdb_id + 100000000
-                                                    if process_tmdb_tv(shifted_id, db, tmdb_client):
-                                                        movie_id = shifted_id
-                                            else:
-                                                tmdb_id = tmdb_client.search_movie(search_title, year)
-                                                if tmdb_id:
-                                                    if process_tmdb_movie(tmdb_id, db, tmdb_client):
-                                                        movie_id = tmdb_id
-                                        except Exception as e:
-                                            logging.error(f"Ошибка поиска в TMDB для {search_title}: {e}")
-
-                                if movie_id:
-                                    logging.info(f"Добавление раздачи: {ru_title} ({year}) -> ID БД: {movie_id}")
-                                    details = rutracker.get_topic_details(topic_id)
-                                    
-                                    if details and details.get('magnet'):
-                                        db.insert_torrent(
-                                            tracker="rutracker",
-                                            topic_id=topic_id,
-                                            movie_id=movie_id,
-                                            topic_title=topic['title'],
-                                            size_gb=round(details['size_gb'], 2),
-                                            quality=details.get('quality', ''),
-                                            file_format='', 
-                                            translation='', 
-                                            magnet_link=details['magnet'],
-                                            seeds=details.get('seeds', topic['seeds']),
-                                            leeches=details.get('leeches', topic['leeches'])
-                                        )
-                                    time.sleep(1.5)
-                            except Exception as e:
-                                logging.error(f"Ошибка при обработке топика {topic.get('topic_id', 'Unknown')}: {e}")
-                                time.sleep(2)
+                            topic_id = topic['topic_id']
+                            
+                            if db.is_torrent_exists("rutracker", topic_id):
+                                db.update_torrent_seeds("rutracker", topic_id, topic['seeds'], topic['leeches'])
+                                continue
+                            
+                            url = f"https://rutracker.org/forum/viewtopic.php?t={topic_id}"
+                            with metadata_lock:
+                                topic_metadata[url] = {
+                                    'tracker': 'rutracker',
+                                    'topic_id': topic_id,
+                                    'topic_title': topic['title'],
+                                    'seeds': topic['seeds'],
+                                    'leeches': topic['leeches'],
+                                    'cat_id': cat_id
+                                }
+                            
+                            logging.info(f"Добавление задачи в Producers для Rutracker URL: {url}")
+                            producer_futures.append(
+                                producers_executor.submit(producer_task, url, 'rutracker', rutracker)
+                            )
                             
             except Exception as e:
                 logging.error(f"Ошибка в главном цикле парсинга Rutracker: {e}")
@@ -466,12 +543,6 @@ def main():
                 319, 885, 910, 912,
                 # Зарубежное кино
                 225, 227, 1296, 1299, 682, 884
-            ]
-            NNM_TV_FORUMS = [
-                # Зарубежные сериалы
-                1344, 779, 1288, 787, 1141, 777, 786, 776, 785, 775, 
-                1265, 1242, 1140, 782, 773, 1142, 772, 771, 783, 1144, 
-                804, 1290, 1300, 784, 774, 922, 770, 780
             ]
             all_nnm_forums = NNM_FORUMS + NNM_TV_FORUMS
             
@@ -495,51 +566,43 @@ def main():
                             db.update_torrent_seeds("nnmclub", topic_id, topic['seeds'], topic['leeches'])
                             continue
                             
-                        ru_title, orig_title, year = nnm.parse_topic_title(topic['title'])
-                        movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
+                        url = f"https://nnmclub.to/forum/viewtopic.php?t={topic_id}"
+                        with metadata_lock:
+                            topic_metadata[url] = {
+                                'tracker': 'nnmclub',
+                                'topic_id': topic_id,
+                                'topic_title': topic['title'],
+                                'seeds': topic['seeds'],
+                                'leeches': topic['leeches'],
+                                'cat_id': f_id
+                            }
                         
-                        if not movie_id:
-                            # Ищем в TMDB
-                            search_title = orig_title if orig_title else ru_title
-                            if search_title:
-                                logging.info(f"NNM В БД не найдено, ищем в TMDB: {search_title} ({year})")
-                                try:
-                                    if f_id in NNM_TV_FORUMS:
-                                        tmdb_id = tmdb_client.search_tv(search_title, year)
-                                        if tmdb_id:
-                                            shifted_id = tmdb_id + 100000000
-                                            if process_tmdb_tv(shifted_id, db, tmdb_client):
-                                                movie_id = shifted_id
-                                    else:
-                                        tmdb_id = tmdb_client.search_movie(search_title, year)
-                                        if tmdb_id:
-                                            if process_tmdb_movie(tmdb_id, db, tmdb_client):
-                                                movie_id = tmdb_id
-                                except Exception as e:
-                                    logging.error(f"NNM Ошибка поиска в TMDB для {search_title}: {e}")
-
-                        if movie_id:
-                            logging.info(f"NNM Новая раздача: {ru_title} ({year}) -> ID БД: {movie_id}")
-                            details = nnm.get_topic_details(topic_id)
-                            if details:
-                                db.insert_torrent(
-                                    tracker="nnmclub", topic_id=topic_id, movie_id=movie_id,
-                                    topic_title=topic['title'], size_gb=round(topic.get('size_gb', details.get('size_gb', 0)), 2),
-                                    quality=details.get('quality', ''), file_format=details.get('file_format', ''), translation=details.get('translation', ''),
-                                    magnet_link=details.get('magnet', ''), seeds=topic['seeds'], leeches=topic['leeches']
-                                )
-                        time.sleep(1)
+                        logging.info(f"Добавление задачи в Producers для NNM-Club URL: {url}")
+                        producer_futures.append(
+                            producers_executor.submit(producer_task, url, 'nnmclub', nnm)
+                        )
                     except Exception as e:
                         logging.error(f"Ошибка на NNM-Club при обработке топика {topic.get('topic_id', 'Unknown')}: {e}")
-                        time.sleep(2)
         else:
             if run_nnmclub:
                 logging.info("Парсинг NNM-Club отменен из-за флага остановки.")
             else:
                 logging.info("Парсинг NNM-Club отключен или не запрошен в этом режиме.")
 
+        # Ожидание завершения всех продюсеров
+        logging.info("Ожидание завершения работы всех Producers...")
+        producers_executor.shutdown(wait=True)
+        
+        # Ждем, пока Consumer обработает все элементы из очереди
+        logging.info("Ожидание завершения обработки очереди Consumer...")
+        html_queue.join()
+        
+        # Останавливаем Consumer
+        html_queue.put(None)
+        consumers_executor.shutdown(wait=True)
+        logging.info("Все потоки Producer-Consumer успешно завершили работу.")
+
     finally:
-        # 4. Архивация базы данных всегда выполняется
         create_zip(db.db_name if 'db' in locals() else "movies.db")
         if os.path.exists(flag_path):
             try:

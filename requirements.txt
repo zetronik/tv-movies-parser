@@ -7,3 +7,6 @@ lxml
 tqdm
 waitress
 boto3
+markdownify
+pydantic
+openai
