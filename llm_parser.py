@@ -1,30 +1,73 @@
 import json
 import re
+from urllib.parse import urlparse
 from openai import OpenAI
 
-# Настройка клиента для локальной LM Studio
-client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+# Настройка клиента для локального Lemonade / LM Studio
+# Убедитесь, что порт соответствует запущенному инстансу Lemonade (обычно 8000 или 15400)
+client = OpenAI(base_url="http://localhost:13305/api/v1", api_key="no_api_key")
 
-# Укажите identifier модели, которая загружена в LM Studio
-MODEL_NAME = "local-model"
+# Укажите identifier модели
+MODEL_NAME = "Gemma-4-E4B-it-GGUF"
+
+def _clean_markdown_links(markdown_text: str) -> str:
+    """
+    Очищает Markdown от заведомо мусорных ссылок, чтобы сжать контекст.
+    Удаляет ссылки на профили, правила, FAQ, и оставляет только потенциально полезные.
+    """
+    lines = markdown_text.split('\n')
+    cleaned_lines = []
+
+    # Регулярные выражения для фильтрации типичного мусора на форумах
+    garbage_patterns = [
+        r'profile\.php', r'memberlist\.php', r'privmsg\.php',
+        r'faq\.php', r'rules\.php', r'search\.php',
+        r'viewonline\.php', r'groupcp\.php', r'register\.php',
+        r'user', r'profile', r'rules', r'advertising', r'reklama'
+    ]
+    garbage_rx = re.compile('|'.join(garbage_patterns), re.IGNORECASE)
+
+    for line in lines:
+        # Проверяем, содержит ли строка ссылку Markdown: [текст](ссылка)
+        match = re.search(r'\[([^\]]+)\]\(([^)]+)\)', line)
+        if match:
+            text, url = match.group(1), match.group(2)
+            # Если ссылка похожа на мусорную — игнорируем строку
+            if garbage_rx.search(url) or garbage_rx.search(text):
+                continue
+
+            # Сохраняем только содержательную часть
+            cleaned_lines.append(f"[{text.strip()}]({url.strip()})")
+        elif line.strip().startswith('#') or 'magnet:?xt=' in line:
+            # Оставляем заголовки и магнет-ссылки
+            cleaned_lines.append(line)
+
+    return '\n'.join(cleaned_lines)
 
 def _call_llm(system_prompt: str, user_content: str) -> dict:
     """Универсальный метод для вызова LLM без сохранения истории."""
     try:
+        # Предварительная очистка входящего контента перед отправкой в модель
+        optimized_content = _clean_markdown_links(user_content)
+
+        # Если после очистки контент остался слишком большим, принудительно его обрезаем
+        # (в среднем 1 токен ≈ 4 символа для английского, для русского — около 1.5-2 символов)
+        # Ограничим лимит в 10 000 символов (~2500-3000 токенов)
+        if len(optimized_content) > 12000:
+            optimized_content = optimized_content[:12000] + "\n... [Часть текста обрезана для экономии контекста] ..."
+
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
+                {"role": "user", "content": optimized_content}
             ],
-            temperature=0.1
-            # Убран response_format, так как LM Studio может его не поддерживать
+            temperature=0
         )
 
         result_text = response.choices[0].message.content.strip()
 
         # Очистка текста от возможных markdown-тегов (```json ... ```)
-        # Ищем всё, что находится между фигурными скобками { ... }
         match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if match:
             clean_json_str = match.group(0)
@@ -68,7 +111,7 @@ def extract_topic_links(markdown_text: str) -> dict:
         "movie_links": ["url3", "url4"],
         "next_page": "url или null"
     }
-    Игнорируй правила форума, профили пользователей, технические разделы и рекламу. Отвечай ТОЛЬКО валидным JSON.
+    Игнорируй правила форума, профили пользователей, технические разделы и рекламы. Отвечай ТОЛЬКО валидным JSON.
     """
     return _call_llm(system_prompt, markdown_text)
 
