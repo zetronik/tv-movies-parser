@@ -3,24 +3,28 @@ import boto3
 import hashlib
 from botocore.client import Config
 import time
-import requests
 import json
 import re
 import logging
+from logging.handlers import RotatingFileHandler
 import zipfile
 import os
 import argparse
-from tqdm import tqdm
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from database import MovieDatabase
 from tmdb_client import TMDBClient
-from rutracker_client import RutrackerClient
-from nnmclub_client import NnmclubClient
 from content_cleaner import clean_html_to_markdown
+from tracker_client import env_float
+from catalog import TV_ID_OFFSET, save_tmdb_movie, save_tmdb_tv
 
 # Импортируем методы для работы с локальной LLM
-from llm_parser import discover_categories, extract_topic_links, extract_torrent_data
+from llm_parser import (
+    check_llm_available,
+    discover_categories,
+    extract_topic_links,
+    extract_torrent_data,
+)
 
 DATA_DIR = 'data/'
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -29,10 +33,163 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(DATA_DIR, 'parser.log'), mode='w', encoding='utf-8'),
+        # Лог накапливается между запусками и ротируется, чтобы не терять историю
+        # предыдущих прогонов и при этом не расти бесконечно.
+        RotatingFileHandler(
+            os.path.join(DATA_DIR, 'parser.log'),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding='utf-8',
+        ),
         logging.StreamHandler(sys.stdout) # Эта строка дублирует вывод в консоль
     ]
 )
+
+# Смещение блокируемого байта в файле замка: за пределами записанного PID.
+LOCK_BYTE_OFFSET = 1024
+
+def acquire_run_lock():
+    """Берет эксклюзивную блокировку на запуск парсера.
+
+    Веб-панель отслеживает только тот процесс, который запустила сама: после ее
+    перезапуска кнопка спокойно поднимала второй парсер поверх работающего, и оба
+    писали в одну базу. Блокировка файловая, поэтому ОС снимает ее сама, если
+    процесс упал — зависших замков не остается.
+
+    Returns:
+        Файловый объект блокировки (держать до конца работы) или None, если
+        парсер уже запущен.
+    """
+    lock_path = os.path.join(DATA_DIR, 'parser.lock')
+    lock_file = open(lock_path, 'a+')
+    try:
+        # Блокируем байт далеко за концом текста: на Windows блокировка
+        # обязательная, и замок на нулевом байте сделал бы PID нечитаемым.
+        lock_file.seek(LOCK_BYTE_OFFSET)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        return None
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+def release_run_lock(lock_file):
+    """Снимает блокировку запуска."""
+    if not lock_file:
+        return
+    try:
+        lock_file.seek(LOCK_BYTE_OFFSET)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError as e:
+        logging.warning(f"Не удалось снять блокировку запуска: {e}")
+    finally:
+        lock_file.close()
+
+def load_tracker_client(tracker_name):
+    """Возвращает класс клиента трекера или None, если зависимости не установлены.
+
+    Клиенты импортируются отложенно и по одному: отсутствие зависимости одного
+    трекера (например, cloudscraper для NNM-Club) не должно ронять весь парсер
+    на этапе импорта, до того как настроено логирование.
+
+    Args:
+        tracker_name: 'rutracker' или 'nnmclub'.
+
+    Returns:
+        Класс клиента либо None, если импорт не удался.
+    """
+    try:
+        if tracker_name == 'rutracker':
+            from rutracker_client import RutrackerClient
+            return RutrackerClient
+        if tracker_name == 'nnmclub':
+            from nnmclub_client import NnmclubClient
+            return NnmclubClient
+        logging.error(f"Неизвестный трекер: {tracker_name}")
+    except ImportError as e:
+        logging.error(
+            f"Клиент '{tracker_name}' недоступен, не установлена зависимость: {e}. "
+            f"Выполните: pip install -r requirements.txt"
+        )
+    return None
+
+# Сколько раз пытаться разобрать раздачу, прежде чем перестать тратить на нее LLM.
+MAX_UNMATCHED_ATTEMPTS = 3
+
+# Предохранители обхода. Форум по построению бесконечен, поэтому прогон
+# ограничен по числу страниц, глубине вложенности разделов и времени.
+# Очередь хранится в БД, так что следующий запуск продолжит с того же места.
+MAX_PAGES_PER_RUN = int(env_float('MAX_PAGES_PER_RUN', 200))
+MAX_CRAWL_DEPTH = int(env_float('MAX_CRAWL_DEPTH', 5))
+MAX_RUNTIME_SECONDS = int(env_float('MAX_RUNTIME_SECONDS', 3600))
+
+# Дневной дамп TMDB содержит около миллиона позиций, и на каждую новую нужен
+# отдельный запрос за карточкой. Поэтому за один прогон догружается ограниченная
+# порция, начиная с самых свежих id; остальное доберется следующими запусками.
+MAX_TMDB_ITEMS_PER_RUN = int(env_float('MAX_TMDB_ITEMS_PER_RUN', 500))
+TMDB_REQUEST_DELAY = env_float('TMDB_REQUEST_DELAY', 0.05)
+
+# Множители перевода в гигабайты. Модель возвращает размер как есть, поэтому
+# единица измерения может быть любой и на любом языке.
+SIZE_UNITS_GB = {
+    'kb': 1 / 1048576, 'kib': 1 / 1048576, 'кб': 1 / 1048576,
+    'mb': 1 / 1024, 'mib': 1 / 1024, 'мб': 1 / 1024,
+    'gb': 1.0, 'gib': 1.0, 'гб': 1.0,
+    'tb': 1024.0, 'tib': 1024.0, 'тб': 1024.0,
+}
+
+def parse_size_gb(raw_size):
+    """Переводит размер раздачи в гигабайты.
+
+    Раньше из строки просто выдиралось первое число, из-за чего "1500 MB"
+    превращалось в 1500 гигабайт.
+
+    Args:
+        raw_size: Размер в свободной форме, например "1.5 GB", "700 МБ", "2,3 TB".
+
+    Returns:
+        Размер в гигабайтах; 0.0, если распознать не удалось.
+
+    Example:
+        >>> parse_size_gb("1500 MB")
+        1.46484375
+    """
+    if raw_size is None:
+        return 0.0
+    if isinstance(raw_size, (int, float)):
+        return float(raw_size)
+
+    match = re.search(r'(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-я]*)', str(raw_size))
+    if not match:
+        return 0.0
+
+    try:
+        value = float(match.group(1).replace(',', '.'))
+    except ValueError:
+        return 0.0
+
+    unit = match.group(2).lower()
+    if not unit:
+        # Без единицы измерения считаем, что это уже гигабайты.
+        return value
+    if unit not in SIZE_UNITS_GB:
+        logging.warning(f"Неизвестная единица размера '{match.group(2)}' в '{raw_size}'.")
+        return value
+    return value * SIZE_UNITS_GB[unit]
 
 def update_progress(task_name, current, total):
     try:
@@ -48,7 +205,7 @@ def get_config():
         with open(os.path.join(DATA_DIR, 'parser_config.json'), 'r', encoding='utf-8') as f:
             return json.load(f)
     except:
-        return {"run_tmdb": True, "run_rutracker": True, "cron_time": "02:00"}
+        return {"run_rutracker": True, "run_nnmclub": True, "cron_time": "02:00"}
 
 def upload_to_r2(file_path):
     endpoint_url = os.environ.get('R2_ENDPOINT_URL')
@@ -75,10 +232,16 @@ def upload_to_r2(file_path):
     except Exception as e:
         logging.error(f"Ошибка при загрузке в R2: {e}")
 
-def create_zip(db_name="movies.db"):
+def create_zip(db_name="movies.db", db=None):
     if not db_name.startswith(DATA_DIR):
         db_name = os.path.join(DATA_DIR, os.path.basename(db_name))
     update_progress("Сжатие базы данных", 99, 100)
+
+    # В режиме WAL свежие транзакции лежат в отдельном файле -wal, поэтому без
+    # чекпоинта в архив попала бы база без последних изменений.
+    if db is not None:
+        db.checkpoint()
+
     try:
         temp_zip = os.path.join(DATA_DIR, "movies_temp.zip")
         final_zip = os.path.join(DATA_DIR, "movies.zip")
@@ -108,60 +271,139 @@ def create_zip(db_name="movies.db"):
     except Exception as e:
         logging.error(f"Ошибка при сжатии базы данных: {e}")
 
-def process_tmdb_movie(movie_id, db, tmdb_client):
+def run_tmdb_catalog_update(db, tmdb_client, flag_path):
+    """Догружает в каталог карточки, которых еще нет, по дневным дампам TMDB.
+
+    TMDB публикует ежедневные выгрузки всех идентификаторов. Сравниваем их с
+    тем, что уже лежит в базе, и добираем недостающее — начиная с самых больших
+    id, то есть с самых новых поступлений.
+
+    Returns:
+        Количество сохраненных карточек.
+    """
+    logging.info("--- Обновление каталога TMDB ---")
+    update_progress("TMDB: загрузка списка id", 0, 100)
+
+    existing = db.get_existing_ids()
+    logging.info(f"В каталоге сейчас карточек: {len(existing)}")
+
+    pending = []
     try:
-        movie = tmdb_client.get_movie_details(movie_id)
-        title = movie.get("title")
-        original_title = movie.get("original_title")
-        overview = movie.get("overview")
-        rating = movie.get("vote_average")
-        release_date = movie.get("release_date")
-        poster_path = movie.get("poster_path")
-        full_poster_url = tmdb_client.get_full_poster_url(poster_path)
-        genres = ", ".join([g.get("name", "") for g in movie.get("genres", []) if g.get("name")])
-        countries = ", ".join([c.get("name", "") for c in movie.get("production_countries", []) if c.get("name")])
-        credits = movie.get("credits", {})
-        directors = ", ".join([crew.get("name", "") for crew in credits.get("crew", []) if crew.get("job") == "Director" and crew.get("name")])
-        actors = ", ".join([cast.get("name", "") for cast in credits.get("cast", [])[:10] if cast.get("name")])
-
-        movie_data = (movie_id, title, original_title, overview, rating, release_date, full_poster_url, genres, countries, directors, actors, 'movie')
-        db.upsert_movie(movie_data)
-        return True
+        movie_ids = tmdb_client.download_daily_movie_ids()
+        pending += [(mid, 'movie') for mid in movie_ids if mid not in existing]
+        logging.info(f"В дампе фильмов TMDB: {len(movie_ids)}")
     except Exception as e:
-        logging.error(f"Ошибка при обработке TMDB ID {movie_id}: {e}")
-    return False
+        logging.error(f"Не удалось скачать дамп фильмов TMDB: {e}")
 
-def process_tmdb_tv(tv_id_shifted, db, tmdb_client):
-    real_id = tv_id_shifted - 100000000
+    if os.path.exists(flag_path):
+        return 0
+
     try:
-        tv = tmdb_client.get_tv_details(real_id)
-        title = tv.get("name")
-        original_title = tv.get("original_name")
-        overview = tv.get("overview")
-        rating = tv.get("vote_average")
-        release_date = tv.get("first_air_date", "")
-        poster_path = tv.get("poster_path")
-        full_poster_url = tmdb_client.get_full_poster_url(poster_path)
-        genres_list = [g.get("name", "") for g in tv.get("genres", []) if g.get("name")]
-        if "Сериал" not in genres_list: genres_list.append("Сериал")
-        genres = ", ".join(genres_list)
-        countries = ", ".join([c.get("name", "") for c in tv.get("production_countries", []) if c.get("name")])
-        credits = tv.get("credits", {})
-        directors = ", ".join([creator.get("name", "") for creator in tv.get("created_by", [])])
-        actors = ", ".join([cast.get("name", "") for cast in credits.get("cast", [])[:10] if cast.get("name")])
-
-        movie_data = (tv_id_shifted, title, original_title, overview, rating, release_date, full_poster_url, genres, countries, directors, actors, 'tv')
-        db.upsert_movie(movie_data)
-        return True
+        tv_ids = tmdb_client.download_daily_tv_ids()
+        pending += [(tid + TV_ID_OFFSET, 'tv') for tid in tv_ids
+                    if tid + TV_ID_OFFSET not in existing]
+        logging.info(f"В дампе сериалов TMDB: {len(tv_ids)}")
     except Exception as e:
-        logging.error(f"Ошибка при обработке TMDB ID сериала {real_id}: {e}")
-    return False
+        logging.error(f"Не удалось скачать дамп сериалов TMDB: {e}")
+
+    if not pending:
+        logging.info("Каталог уже содержит все позиции из дампов TMDB.")
+        return 0
+
+    # Самые свежие поступления имеют наибольшие id.
+    pending.sort(reverse=True)
+    total_new = len(pending)
+    batch = pending[:MAX_TMDB_ITEMS_PER_RUN]
+    logging.info(
+        f"Отсутствует карточек: {total_new}. За этот прогон загрузим {len(batch)}."
+    )
+
+    saved = 0
+    for number, (item_id, kind) in enumerate(batch, start=1):
+        if os.path.exists(flag_path):
+            logging.info("TMDB: получен сигнал остановки.")
+            break
+
+        if kind == 'tv':
+            ok = save_tmdb_tv(item_id, db, tmdb_client)
+        else:
+            ok = save_tmdb_movie(item_id, db, tmdb_client)
+        if ok:
+            saved += 1
+
+        if number % 20 == 0 or number == len(batch):
+            update_progress("TMDB: загрузка карточек", number, len(batch))
+            logging.info(f"TMDB: обработано {number} из {len(batch)}, сохранено {saved}.")
+
+        time.sleep(TMDB_REQUEST_DELAY)
+
+    remaining = total_new - saved
+    logging.info(
+        f"TMDB: сохранено {saved} карточек. Осталось загрузить примерно {remaining}."
+    )
+    return saved
+
+
+def run_trends_update(db, tmdb_client, flag_path):
+    """Обновляет подборку «сейчас смотрят»: премьеры кино и популярные сериалы.
+
+    Это единственное, что наполняет таблицу now_playing — до сих пор она всегда
+    оставалась пустой, хотя счетчик и страница в панели существуют.
+
+    Returns:
+        Количество сохраненных карточек.
+    """
+    logging.info("--- Обновление подборки now_playing ---")
+    update_progress("TMDB: премьеры и тренды", 0, 100)
+
+    saved = 0
+    featured = []
+
+    try:
+        movie_ids = tmdb_client.get_now_playing_movies()
+        logging.info(f"Премьер в прокате: {len(movie_ids)}")
+        for movie_id in movie_ids:
+            if os.path.exists(flag_path):
+                break
+            if save_tmdb_movie(movie_id, db, tmdb_client):
+                featured.append(movie_id)
+                saved += 1
+            time.sleep(TMDB_REQUEST_DELAY)
+    except Exception as e:
+        logging.error(f"Не удалось получить премьеры TMDB: {e}")
+
+    try:
+        tv_ids = tmdb_client.get_trending_tv_shows()
+        logging.info(f"Популярных сериалов: {len(tv_ids)}")
+        for tv_id in tv_ids:
+            if os.path.exists(flag_path):
+                break
+            shifted = tv_id + TV_ID_OFFSET
+            if save_tmdb_tv(shifted, db, tmdb_client):
+                featured.append(shifted)
+                saved += 1
+            time.sleep(TMDB_REQUEST_DELAY)
+    except Exception as e:
+        logging.error(f"Не удалось получить тренды сериалов TMDB: {e}")
+
+    if featured:
+        db.update_now_playing_list(featured)
+        logging.info(f"Подборка now_playing обновлена: {len(featured)} позиций.")
+    else:
+        logging.warning("Подборка now_playing не обновлена: получить нечего.")
+
+    return saved
+
 
 def run_tracker_pipeline(tracker_name, start_url, client, db, tmdb_client, flag_path):
     """
     Основной конечный автомат для парсинга трекера через локальную LLM с поддержкой подразделов.
+
+    Returns:
+        Количество раздач, добавленных в базу за прогон.
     """
     logging.info(f"--- Запуск LLM-парсинга: {tracker_name} ---")
+    inserted_count = 0
     topology = db.get_tracker_topology(tracker_name)
 
     # СТАДИЯ А: Исследователь (Поиск корневых разделов)
@@ -176,33 +418,75 @@ def run_tracker_pipeline(tracker_name, start_url, client, db, tmdb_client, flag_
             movies_url = urls_json.get('movies_url')
         except Exception as e:
             logging.error(f"[{tracker_name}] Ошибка на стадии Discovery: {e}")
-            return
+            return inserted_count
     else:
         movies_url = topology.get('movies_url')
         logging.info(f"[{tracker_name}] Раздел фильмов загружен из БД: {movies_url}")
 
     if not movies_url:
         logging.error(f"[{tracker_name}] URL раздела фильмов не определен. Парсинг остановлен.")
-        return
+        return inserted_count
 
-    # Очередь для обхода: сюда попадают и корневые разделы, и подразделы, и страницы пагинации
-    root_movies_url = urljoin(start_url, movies_url)
-    pages_queue = [root_movies_url]
-    visited_pages = set() # Множество для защиты от бесконечных циклов
+    # Корневой раздел тоже приходит от модели. Форму URL здесь только проверяем
+    # предупреждением: раздел мог называться иначе, а жесткий отказ остановил бы
+    # весь обход. А вот уход на чужой домен недопустим в любом случае.
+    root_movies_url = client.resolve_url(movies_url, start_url, 'forum')
+    if not root_movies_url:
+        root_movies_url = urljoin(start_url, movies_url)
+        if urlparse(root_movies_url).netloc.lower() != urlparse(client.base_domain).netloc.lower():
+            logging.error(
+                f"[{tracker_name}] Раздел фильмов ведет на чужой домен: {root_movies_url}. Обход отменен."
+            )
+            return inserted_count
+        logging.warning(
+            f"[{tracker_name}] Раздел фильмов не похож на страницу форума: {root_movies_url}. Пробуем как есть."
+        )
+
+    if db.count_frontier(tracker_name, 'pending') == 0:
+        restored = db.restart_frontier(tracker_name)
+        if restored:
+            logging.info(f"[{tracker_name}] Новый проход: возвращено в очередь страниц — {restored}.")
+    db.enqueue_page(tracker_name, root_movies_url, depth=0)
+
+    started_at = time.monotonic()
+    pages_processed = 0
 
     # СТАДИЯ Б: Навигатор (Проход по очереди страниц)
-    while pages_queue:
+    while True:
         if os.path.exists(flag_path):
             logging.info(f"[{tracker_name}] Получен сигнал остановки.")
             break
 
-        current_page = pages_queue.pop(0) # Берем первую ссылку из очереди
+        if pages_processed >= MAX_PAGES_PER_RUN:
+            logging.info(
+                f"[{tracker_name}] Достигнут лимит страниц за прогон ({MAX_PAGES_PER_RUN}). "
+                f"Очередь сохранена, обход продолжится в следующий раз."
+            )
+            break
 
-        if current_page in visited_pages:
-            continue
+        elapsed = time.monotonic() - started_at
+        if elapsed > MAX_RUNTIME_SECONDS:
+            logging.info(
+                f"[{tracker_name}] Достигнут лимит времени ({MAX_RUNTIME_SECONDS} с). "
+                f"Очередь сохранена."
+            )
+            break
 
-        visited_pages.add(current_page)
-        logging.info(f"[{tracker_name}] Навигация. Очередь: {len(pages_queue)} | Обработка: {current_page}")
+        page = db.next_pending_page(tracker_name)
+        if not page:
+            logging.info(f"[{tracker_name}] Очередь обхода пуста.")
+            break
+
+        current_page, depth = page
+        pages_processed += 1
+
+        done_count = db.count_frontier(tracker_name, 'done')
+        pending_count = db.count_frontier(tracker_name, 'pending')
+        update_progress(f"Обход {tracker_name}", done_count, done_count + pending_count)
+        logging.info(
+            f"[{tracker_name}] Навигация. Глубина: {depth} | В очереди: {pending_count} | "
+            f"Обработка: {current_page}"
+        )
 
         try:
             html = client.fetch_page(current_page)
@@ -212,102 +496,173 @@ def run_tracker_pipeline(tracker_name, start_url, client, db, tmdb_client, flag_
             movie_links = page_data.get('movie_links') or []
             subforum_links = page_data.get('subforum_links') or []
             next_page = page_data.get('next_page')
-
-            logging.info(f"[{tracker_name}] Найдено: {len(subforum_links)} подразделов, {len(movie_links)} раздач.")
-
-            # Добавляем найденные подразделы в конец очереди
-            for sf_link in subforum_links:
-                if sf_link:
-                    full_sf_link = urljoin(current_page, sf_link)
-                    if full_sf_link not in visited_pages:
-                        pages_queue.append(full_sf_link)
-
-            # Добавляем следующую страницу (пагинацию) в очередь
-            if next_page:
-                full_next_page = urljoin(current_page, next_page)
-                if full_next_page not in visited_pages:
-                    pages_queue.append(full_next_page)
-
         except Exception as e:
             logging.error(f"[{tracker_name}] Ошибка на стадии Навигации ({current_page}): {e}")
+            db.mark_page(tracker_name, current_page, 'failed')
             continue
 
-        # СТАДИЯ В: Экстрактор (Сбор данных с конкретной раздачи)
+        # Ссылки от модели проверяются на домен и форму: она может выдумать URL
+        # или отнести раздачу к подразделам.
+        queued_subforums = 0
+        if depth < MAX_CRAWL_DEPTH:
+            for sf_link in subforum_links:
+                resolved = client.resolve_url(sf_link, current_page, 'forum')
+                if resolved and db.enqueue_page(tracker_name, resolved, depth + 1):
+                    queued_subforums += 1
+        elif subforum_links:
+            logging.info(f"[{tracker_name}] Глубина {depth} — подразделы дальше не раскрываем.")
+
+        # Пагинация остается на той же глубине: это продолжение того же раздела.
+        if next_page:
+            resolved_next = client.resolve_url(next_page, current_page, 'forum')
+            if resolved_next:
+                db.enqueue_page(tracker_name, resolved_next, depth)
+
+        valid_topics = []
         for link in movie_links:
-            if not link: continue
-            if os.path.exists(flag_path): break
+            resolved = client.resolve_url(link, current_page, 'topic')
+            if resolved:
+                valid_topics.append(resolved)
 
-            full_link = urljoin(current_page, link)
-            topic_id = client.extract_topic_id(full_link)
+        rejected = len(movie_links) - len(valid_topics)
+        logging.info(
+            f"[{tracker_name}] Найдено: {len(subforum_links)} подразделов "
+            f"(в очередь {queued_subforums}), {len(valid_topics)} раздач"
+            + (f", отброшено ссылок: {rejected}" if rejected else "")
+        )
 
-            if not topic_id:
-                continue
+        # СТАДИЯ В: Экстрактор (Сбор данных с конкретной раздачи)
+        for topic_url in valid_topics:
+            if os.path.exists(flag_path):
+                break
+            if process_topic(tracker_name, topic_url, client, db, tmdb_client):
+                inserted_count += 1
 
-            if db.is_torrent_exists(tracker_name, topic_id):
-                logging.info(f"  -> Пропуск: Раздача {topic_id} уже в базе.")
-                continue
+        db.mark_page(tracker_name, current_page, 'done')
 
-            logging.info(f"  -> Анализ раздачи: {full_link}")
-            try:
-                topic_html = client.fetch_page(full_link)
-                topic_md = clean_html_to_markdown(topic_html)
+    logging.info(
+        f"[{tracker_name}] Обработано страниц: {pages_processed}, добавлено раздач: {inserted_count}."
+    )
+    return inserted_count
 
-                extracted = extract_torrent_data(topic_md)
-                if not extracted:
-                    logging.warning(f"  [!] LLM не смогла извлечь данные.")
-                    continue
+def process_topic(tracker_name, topic_url, client, db, tmdb_client):
+    """Разбирает страницу раздачи и привязывает ее к фильму.
 
-                ru_title = extracted.get('title') or extracted.get('ru_title', '')
-                orig_title = extracted.get('original_title') or extracted.get('orig_title', '')
-                year_raw = extracted.get('year', '')
-                year = str(year_raw) if year_raw else ''
+    Args:
+        tracker_name: Имя трекера.
+        topic_url: Абсолютная ссылка на страницу раздачи.
+        client: Клиент трекера.
+        db: Экземпляр MovieDatabase.
+        tmdb_client: Клиент TMDB для поиска отсутствующих фильмов.
 
-                if not ru_title:
-                    continue
+    Returns:
+        True, если раздача добавлена в базу.
+    """
+    topic_id = client.extract_topic_id(topic_url)
+    if not topic_id:
+        return False
 
-                movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
+    if db.is_torrent_exists(tracker_name, topic_id):
+        logging.info(f"  -> Пропуск: Раздача {topic_id} уже в базе.")
+        return False
 
-                if not movie_id:
-                    search_title = orig_title if orig_title else ru_title
-                    if search_title:
-                        tmdb_id = tmdb_client.search_movie(search_title, year)
-                        if tmdb_id:
-                            if process_tmdb_movie(tmdb_id, db, tmdb_client):
-                                movie_id = tmdb_id
+    # Раздачи, которые уже несколько раз не поддались разбору, не стоят
+    # очередного похода в LLM — они лежат в unmatched_torrents для разбора.
+    attempts = db.get_unmatched_attempts(tracker_name, topic_id)
+    if attempts >= MAX_UNMATCHED_ATTEMPTS:
+        logging.info(f"  -> Пропуск: Раздача {topic_id} не разобрана за {attempts} попыток.")
+        return False
 
-                if movie_id:
-                    size_str = str(extracted.get('size', '0'))
-                    size_match = re.search(r'[\d\.]+', size_str.replace(',', '.'))
-                    size_val = float(size_match.group()) if size_match else 0.0
+    logging.info(f"  -> Анализ раздачи: {topic_url}")
+    try:
+        topic_html = client.fetch_page(topic_url)
+        topic_md = clean_html_to_markdown(topic_html)
 
-                    db.insert_torrent(
-                        tracker=tracker_name,
-                        topic_id=topic_id,
-                        movie_id=movie_id,
-                        topic_title=ru_title,
-                        size_gb=size_val,
-                        quality=extracted.get('video_quality') or extracted.get('quality', ''),
-                        file_format='',
-                        translation='',
-                        magnet_link=extracted.get('magnet_link', ''),
-                        seeds=0,
-                        leeches=0
-                    )
-                    logging.info(f"  [+] Добавлено: {ru_title} -> ID фильма: {movie_id}")
-                else:
-                    logging.warning(f"  [-] Не удалось привязать к фильму: {ru_title} ({year})")
+        extracted = extract_torrent_data(topic_md)
+        if not extracted:
+            logging.warning(f"  [!] LLM не смогла извлечь данные.")
+            db.save_unmatched(tracker_name, topic_id, topic_url, 'llm_empty')
+            return False
 
-            except Exception as e:
-                logging.error(f"  [!] Ошибка при извлечении раздачи {full_link}: {e}")
+        ru_title = extracted.get('title') or extracted.get('ru_title', '')
+        orig_title = extracted.get('original_title') or extracted.get('orig_title', '')
+        year_raw = extracted.get('year', '')
+        year = str(year_raw) if year_raw else ''
+        size_val = parse_size_gb(extracted.get('size'))
+        quality = extracted.get('video_quality') or extracted.get('quality', '')
+        magnet_link = extracted.get('magnet_link', '')
+        raw_json = json.dumps(extracted, ensure_ascii=False)
+
+        if not ru_title:
+            logging.warning(f"  [!] В ответе LLM нет названия раздачи.")
+            db.save_unmatched(
+                tracker_name, topic_id, topic_url, 'no_title',
+                original_title=orig_title, year=year, size_gb=size_val,
+                quality=quality, magnet_link=magnet_link, raw_json=raw_json
+            )
+            return False
+
+        movie_id = db.find_movie_by_title_and_year(ru_title, orig_title, year)
+
+        if not movie_id:
+            search_title = orig_title if orig_title else ru_title
+            if search_title:
+                tmdb_id = tmdb_client.search_movie(search_title, year)
+                if tmdb_id:
+                    if save_tmdb_movie(tmdb_id, db, tmdb_client):
+                        movie_id = tmdb_id
+
+        if movie_id:
+            db.insert_torrent(
+                tracker=tracker_name,
+                topic_id=topic_id,
+                movie_id=movie_id,
+                topic_title=ru_title,
+                size_gb=size_val,
+                quality=quality,
+                file_format='',
+                translation='',
+                magnet_link=magnet_link,
+                seeds=0,
+                leeches=0
+            )
+            # Раздача могла лежать в очереди непривязанных с прошлых прогонов.
+            if attempts:
+                db.delete_unmatched(tracker_name, topic_id)
+            logging.info(f"  [+] Добавлено: {ru_title} -> ID фильма: {movie_id}")
+            return True
+
+        logging.warning(f"  [-] Не удалось привязать к фильму: {ru_title} ({year})")
+        db.save_unmatched(
+            tracker_name, topic_id, topic_url, 'no_tmdb_match',
+            ru_title=ru_title, original_title=orig_title, year=year,
+            size_gb=size_val, quality=quality, magnet_link=magnet_link,
+            raw_json=raw_json
+        )
+        return False
+
+    except Exception as e:
+        logging.error(f"  [!] Ошибка при извлечении раздачи {topic_url}: {e}")
+        return False
 
 def main():
     parser = argparse.ArgumentParser(description="Movies Parser")
-    parser.add_argument('--mode', choices=['tmdb', 'rutracker', 'nnmclub', 'cron', 'trends'], required=True, help='Режим работы парсера')
+    parser.add_argument(
+        '--mode',
+        choices=['tmdb', 'rutracker', 'nnmclub', 'cron', 'trends', 'publish'],
+        required=True,
+        help='Режим работы парсера. publish — только упаковка базы и выгрузка в облако.'
+    )
     args = parser.parse_args()
 
     config = get_config()
     update_progress("Инициализация", 0, 100)
     logging.info(f"--- Запуск парсера фильмов (Режим: {args.mode}) ---")
+
+    run_lock = acquire_run_lock()
+    if not run_lock:
+        logging.error("Парсер уже запущен (блокировка data/parser.lock). Запуск отменен.")
+        sys.exit(3)
 
     flag_path = os.path.join(DATA_DIR, 'stop.flag')
     if os.path.exists(flag_path):
@@ -316,6 +671,42 @@ def main():
         except OSError:
             pass
 
+    # Режим publish ничего не парсит: он нужен, чтобы выгрузить базу после
+    # ручных правок из веб-панели, не запуская обход трекеров.
+    if args.mode == 'publish':
+        try:
+            db = MovieDatabase()
+            logging.info("Публикация базы по запросу.")
+            create_zip(db.db_name, db)
+        except Exception as e:
+            logging.error(f"Ошибка при публикации базы: {e}")
+            sys.exit(1)
+        finally:
+            release_run_lock(run_lock)
+            logging.info("--- Работа скрипта завершена ---")
+            update_progress("Ожидание", 0, 0)
+        return
+
+    run_rutracker = args.mode == 'rutracker' or (args.mode == 'cron' and config.get("run_rutracker", True))
+    run_nnmclub = args.mode == 'nnmclub' or (args.mode == 'cron' and config.get("run_nnmclub", True))
+    # Оба режима ходят в TMDB, поэтому в ночном прогоне участвуют только когда
+    # включены явно: молча начать сетевую работу за пользователя неправильно.
+    run_tmdb = args.mode == 'tmdb' or (args.mode == 'cron' and config.get("run_tmdb", False))
+    run_trends = args.mode == 'trends' or (args.mode == 'cron' and config.get("run_trends", False))
+
+    # Проверки, не требующие БД, выполняются до блока try: при неудаче нет смысла
+    # заходить в finally и упаковывать базу впустую.
+    tmdb_client = TMDBClient()
+    if not tmdb_client.read_token and not tmdb_client.api_key:
+        logging.error("Ошибка: API ключи TMDB не найдены в файле .env.")
+        sys.exit(1)
+
+    if (run_rutracker or run_nnmclub) and not check_llm_available():
+        logging.error("Парсинг трекеров невозможен без локальной LLM. Запуск отменен.")
+        sys.exit(1)
+
+    db = None
+    total_inserted = 0
     try:
         try:
             db = MovieDatabase()
@@ -323,36 +714,53 @@ def main():
             logging.error(f"Ошибка при инициализации БД: {e}")
             sys.exit(1)
 
-        run_rutracker = args.mode == 'rutracker' or (args.mode == 'cron' and config.get("run_rutracker", True))
-        run_nnmclub = args.mode == 'nnmclub' or (args.mode == 'cron' and config.get("run_nnmclub", True))
+        # 1. Обновление каталога из TMDB
+        if run_tmdb and not os.path.exists(flag_path):
+            total_inserted += run_tmdb_catalog_update(db, tmdb_client, flag_path)
 
-        tmdb_client = TMDBClient()
-        if not tmdb_client.read_token and not tmdb_client.api_key:
-            logging.error("Ошибка: API ключи TMDB не найдены в файле .env.")
-            sys.exit(1)
+        # 2. Премьеры и популярные сериалы
+        if run_trends and not os.path.exists(flag_path):
+            total_inserted += run_trends_update(db, tmdb_client, flag_path)
 
-        # 1. Запуск пайплайна Rutracker
+        # 3. Запуск пайплайна Rutracker
         if run_rutracker and not os.path.exists(flag_path):
             update_progress("Парсинг Rutracker", 0, 100)
-            rutracker = RutrackerClient()
-            if rutracker.login():
-                run_tracker_pipeline('rutracker', f"{rutracker.base_domain}/forum/index.php", rutracker, db, tmdb_client, flag_path)
-            else:
-                logging.error("Не удалось авторизоваться на Rutracker.")
+            rutracker_cls = load_tracker_client('rutracker')
+            if rutracker_cls:
+                rutracker = rutracker_cls()
+                try:
+                    authorized = rutracker.login()
+                except Exception as e:
+                    logging.error(f"Ошибка авторизации на Rutracker: {e}")
+                    authorized = False
+                if authorized:
+                    total_inserted += run_tracker_pipeline('rutracker', f"{rutracker.base_domain}/forum/index.php", rutracker, db, tmdb_client, flag_path)
+                else:
+                    logging.error("Не удалось авторизоваться на Rutracker.")
 
-        # 2. Запуск пайплайна NNM-Club
+        # 4. Запуск пайплайна NNM-Club
         if run_nnmclub and not os.path.exists(flag_path):
             update_progress("Парсинг NNM-Club", 0, 100)
-            nnm = NnmclubClient()
-            run_tracker_pipeline('nnmclub', f"{nnm.base_domain}/forum/index.php", nnm, db, tmdb_client, flag_path)
+            nnm_cls = load_tracker_client('nnmclub')
+            if nnm_cls:
+                nnm = nnm_cls()
+                total_inserted += run_tracker_pipeline('nnmclub', f"{nnm.base_domain}/forum/index.php", nnm, db, tmdb_client, flag_path)
 
     finally:
-        create_zip(db.db_name if 'db' in locals() else "movies.db")
+        # Архив весит сотни мегабайт и уезжает в облако — упаковываем только если
+        # база действительно изменилась либо архива еще нет.
+        archive_exists = os.path.exists(os.path.join(DATA_DIR, "movies.zip"))
+        if total_inserted > 0 or not archive_exists:
+            logging.info(f"Изменений за прогон: {total_inserted}. Упаковка базы.")
+            create_zip(db.db_name if db else "movies.db", db)
+        else:
+            logging.info("Изменений нет — архивация и выгрузка в облако пропущены.")
         if os.path.exists(flag_path):
             try:
                 os.remove(flag_path)
             except OSError:
                 pass
+        release_run_lock(run_lock)
         logging.info("--- Работа скрипта завершена ---")
         update_progress("Ожидание", 0, 0)
 

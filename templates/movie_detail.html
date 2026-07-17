@@ -39,7 +39,14 @@
     </div>
 </div>
 
-<h3 class="mb-3 border-bottom border-secondary pb-2">Available Torrents <span class="badge bg-secondary ms-2">{{ torrents|length }}</span></h3>
+<div class="d-flex justify-content-between align-items-center border-bottom border-secondary pb-2 mb-3">
+    <h3 class="mb-0">Available Torrents <span class="badge bg-secondary ms-2">{{ torrents|length }}</span></h3>
+    <button class="btn btn-outline-primary" id="btnFindTorrents" onclick="openPicker()">
+        🔍 Найти раздачи вручную
+    </button>
+</div>
+
+<div id="picker" class="mb-4"></div>
 
 {% if torrents %}
 <div class="card shadow-sm">
@@ -91,4 +98,19 @@
   No torrents found for this movie yet.
 </div>
 {% endif %}
+
+<script src="{{ url_for('static', filename='torrent_picker.js') }}"></script>
+<script>
+  const currentMovie = {{ movie|tojson }};
+
+  function openPicker() {
+    document.getElementById("btnFindTorrents").disabled = true;
+    TorrentPicker.mount("picker", currentMovie, {
+      autoSearch: true,
+      // Список раздач на этой странице отрисован сервером, поэтому после
+      // добавления проще перезагрузить ее, чем чинить таблицу на месте.
+      onAttached: () => setTimeout(() => location.reload(), 1500),
+    });
+  }
+</script>
 {% endblock %}

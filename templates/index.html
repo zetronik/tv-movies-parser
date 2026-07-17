@@ -45,6 +45,19 @@
       </div>
     </div>
   </div>
+
+  <div class="col-md-3">
+    <div class="card shadow-sm h-100">
+      <div class="card-body text-center">
+        <h5 class="card-title text-muted" title="Раздачи, которые не удалось привязать к фильму">
+          Unmatched Torrents
+        </h5>
+        <h1 class="display-4 text-danger" id="unmatchedCount">
+          {{ unmatched_count }}
+        </h1>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="mt-4 mb-4">
@@ -74,6 +87,12 @@
             <input class="form-check-input" type="checkbox" id="runTmdb" />
             <label class="form-check-label" for="runTmdb"
               >Update TMDB catalog</label
+            >
+          </div>
+          <div class="form-check form-switch mb-3">
+            <input class="form-check-input" type="checkbox" id="runTrends" />
+            <label class="form-check-label" for="runTrends"
+              >Update Now Playing &amp; Trends</label
             >
           </div>
           <div class="form-check form-switch mb-3">
@@ -111,6 +130,7 @@
             id="btnStartTmdb"
             class="btn btn-sm btn-info me-2"
             onclick="parserAction('start_tmdb')"
+            title="Догрузить недостающие карточки по дневным дампам TMDB"
           >
             ▶ Update TMDB
           </button>
@@ -118,6 +138,7 @@
             id="btnStartTrends"
             class="btn btn-sm btn-outline-info me-2"
             onclick="parserAction('start_trends')"
+            title="Обновить премьеры в прокате и популярные сериалы"
           >
             ▶ Update Trends
           </button>
@@ -195,19 +216,25 @@
     .then((res) => res.json())
     .then((data) => {
       document.getElementById("cronTime").value = data.cron_time || "02:00";
-      document.getElementById("runTmdb").checked = data.run_tmdb;
+      document.getElementById("runTmdb").checked = data.run_tmdb === true;
+      document.getElementById("runTrends").checked = data.run_trends === true;
       document.getElementById("runRutracker").checked = data.run_rutracker;
       document.getElementById("runNnmclub").checked =
         data.run_nnmclub !== false;
     });
 
-  function saveConfig() {
-    const payload = {
+  function currentConfig() {
+    return {
       cron_time: document.getElementById("cronTime").value,
       run_tmdb: document.getElementById("runTmdb").checked,
+      run_trends: document.getElementById("runTrends").checked,
       run_rutracker: document.getElementById("runRutracker").checked,
       run_nnmclub: document.getElementById("runNnmclub").checked,
     };
+  }
+
+  function saveConfig() {
+    const payload = currentConfig();
     fetch("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -216,22 +243,18 @@
   }
 
   function parserAction(actionType) {
-    if (
-      actionType === "start_tmdb" ||
-      actionType === "start_rutracker" ||
-      actionType === "start_nnmclub"
-    ) {
-      const payload = {
-        cron_time: document.getElementById("cronTime").value,
-        run_tmdb: document.getElementById("runTmdb").checked,
-        run_rutracker: document.getElementById("runRutracker").checked,
-        run_nnmclub: document.getElementById("runNnmclub").checked,
-      };
+    const savesConfigFirst = [
+      "start_tmdb",
+      "start_trends",
+      "start_rutracker",
+      "start_nnmclub",
+    ];
+    if (savesConfigFirst.includes(actionType)) {
       // Сначала сохраняем конфиг, затем запускаем
       fetch("/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(currentConfig()),
       }).then(() => {
         fetch("/api/action", {
           method: "POST",
@@ -322,6 +345,10 @@
         if (data.now_playing_count !== undefined) {
           document.getElementById("nowPlayingCount").textContent =
             data.now_playing_count;
+        }
+        if (data.unmatched_count !== undefined) {
+          document.getElementById("unmatchedCount").textContent =
+            data.unmatched_count;
         }
 
         taskName.textContent = task;

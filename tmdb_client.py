@@ -4,11 +4,22 @@ import datetime
 import gzip
 import json
 import io
+import logging
 from dotenv import load_dotenv
+
+from catalog import TV_ID_OFFSET
 
 load_dotenv()
 
 class TMDBClient:
+    """Клиент TMDB.
+
+    Пайплайн трекеров использует только search_movie, get_movie_details и
+    get_full_poster_url. Остальные методы (дневные дампы ID, now_playing,
+    trending, поиск сериалов) не подключены: они писались под режимы 'tmdb' и
+    'trends', обработчиков которых в main.py нет. Оставлены как заготовка.
+    """
+
     BASE_URL = "https://api.themoviedb.org/3"
     IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
 
@@ -118,6 +129,59 @@ class TMDBClient:
         response.raise_for_status()
         results = response.json().get("results", [])
         return results[0]['id'] if results else None
+
+    def search_candidates(self, query, year=None, limit=10):
+        """Ищет фильмы и сериалы по названию и возвращает список кандидатов.
+
+        В отличие от search_movie, который молча берет первый результат, здесь
+        возвращаются варианты для ручного выбора в панели.
+
+        Args:
+            query: Название для поиска.
+            year: Год выпуска, если известен.
+            limit: Максимальное число кандидатов в ответе.
+
+        Returns:
+            Список словарей с ключами id, media_type, title, original_title,
+            year, overview, poster_url, rating. Для сериалов id уже сдвинут
+            на TV_ID_OFFSET, чтобы совпадать с идентификатором в каталоге.
+        """
+        candidates = []
+
+        for media_type in ('movie', 'tv'):
+            url = f"{self.BASE_URL}/search/{media_type}"
+            params = {"language": "ru-RU", "query": query, "page": 1}
+            if year:
+                params["primary_release_year" if media_type == 'movie' else "first_air_date_year"] = year
+            if not self.read_token and self.api_key:
+                params["api_key"] = self.api_key
+
+            try:
+                response = requests.get(url, headers=self.headers, params=params, timeout=15)
+                response.raise_for_status()
+                results = response.json().get("results", [])
+            except requests.RequestException as e:
+                logging.error(f"Ошибка поиска в TMDB ({media_type}): {e}")
+                continue
+
+            for item in results:
+                release = item.get("release_date") or item.get("first_air_date") or ""
+                candidates.append({
+                    "id": item["id"] + (TV_ID_OFFSET if media_type == 'tv' else 0),
+                    "tmdb_id": item["id"],
+                    "media_type": media_type,
+                    "title": item.get("title") or item.get("name") or "",
+                    "original_title": item.get("original_title") or item.get("original_name") or "",
+                    "year": release[:4],
+                    "overview": (item.get("overview") or "")[:300],
+                    "poster_url": self.get_full_poster_url(item.get("poster_path")),
+                    "rating": item.get("vote_average") or 0,
+                    "popularity": item.get("popularity") or 0,
+                })
+
+        # Самые популярные вперед: так нужный вариант обычно оказывается сверху.
+        candidates.sort(key=lambda c: c["popularity"], reverse=True)
+        return candidates[:limit]
 
     def get_full_poster_url(self, poster_path):
         """

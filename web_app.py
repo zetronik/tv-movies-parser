@@ -1,20 +1,81 @@
-from flask import Flask, render_template, request, jsonify, abort
+from flask import Flask, render_template, request, jsonify, abort, send_file, Response
 import sqlite3
+import hmac
+import logging
 import math
 import os
+import sys
 import json
 import subprocess
 import time
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from dotenv import load_dotenv
+
+from catalog import save_tmdb_candidate
+from database import MovieDatabase
+from tmdb_client import TMDBClient
+
+load_dotenv()
 
 app = Flask(__name__)
+
+# Панель умеет запускать процессы и останавливать сервер, поэтому без пароля
+# пускаем только с самой машины. Архив базы отдается без пароля: его же раздает
+# публичный бакет R2, и на него могут ходить клиентские приложения.
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+PUBLIC_ENDPOINTS = {'download_db'}
+LOCAL_ADDRESSES = {'127.0.0.1', '::1', 'localhost'}
+
+if not ADMIN_PASSWORD:
+    logging.warning(
+        "ADMIN_PASSWORD не задан: панель доступна только с localhost. "
+        "Задайте пароль в .env, если открываете порт наружу."
+    )
+
+
+def _password_matches(supplied):
+    """Сравнивает пароль за постоянное время, чтобы не подсказывать его перебором."""
+    return hmac.compare_digest(supplied or '', ADMIN_PASSWORD or '')
+
+
+@app.before_request
+def require_auth():
+    """Закрывает панель паролем; без пароля пускает только локальные запросы."""
+    if request.endpoint in PUBLIC_ENDPOINTS or request.endpoint == 'static':
+        return None
+
+    if not ADMIN_PASSWORD:
+        if request.remote_addr in LOCAL_ADDRESSES:
+            return None
+        logging.warning(f"Отклонен внешний запрос с {request.remote_addr}: пароль не задан.")
+        return abort(403)
+
+    auth = request.authorization
+    if auth and auth.username == ADMIN_USER and _password_matches(auth.password):
+        return None
+
+    return Response(
+        'Требуется авторизация.', 401,
+        {'WWW-Authenticate': 'Basic realm="Movies Parser"'}
+    )
+
+
 DATA_DIR = 'data/'
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_NAME = os.path.join(DATA_DIR, "movies.db")
 
 # Глобальное состояние для процесса
 parser_process = None
+# Клиенты трекеров для страницы поиска; создаются при первом обращении.
+tracker_clients = None
+# Причины, по которым какой-то трекер не поднялся, — показываем их в панели.
+tracker_errors = []
+# APScheduler на уровне INFO рапортует о старте и о каждой постановке задачи.
+# В окне логов на дашборде это вытесняет полезные строки парсера.
+logging.getLogger('apscheduler').setLevel(logging.WARNING)
+
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -23,7 +84,7 @@ def get_parser_config():
         with open(os.path.join(DATA_DIR, 'parser_config.json'), 'r', encoding='utf-8') as f:
             return json.load(f)
     except:
-        return {"run_tmdb": True, "run_rutracker": True, "run_nnmclub": True, "cron_time": "02:00"}
+        return {"run_rutracker": True, "run_nnmclub": True, "cron_time": "02:00"}
 
 def save_parser_config(data):
     with open(os.path.join(DATA_DIR, 'parser_config.json'), 'w', encoding='utf-8') as f:
@@ -36,8 +97,10 @@ def start_parser_task(mode):
         if os.path.exists(flag_path):
             try: os.remove(flag_path)
             except OSError: pass
-        # Процесс не запущен или уже завершился
-        parser_process = subprocess.Popen(["python", "main.py", "--mode", mode])
+        # Процесс не запущен или уже завершился.
+        # sys.executable, а не "python": в venv и в контейнере из PATH может
+        # взяться другой интерпретатор, без установленных зависимостей.
+        parser_process = subprocess.Popen([sys.executable, "main.py", "--mode", mode])
 
 def update_cron_job(cron_time_str):
     try:
@@ -57,7 +120,9 @@ def make_searchable(text):
     return str(text).lower().replace('ё', 'е')
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
+    # timeout нужен, потому что панель читает базу, пока парсер (отдельный процесс)
+    # в нее пишет. Без него любое пересечение дает "database is locked".
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.create_function("searchable", 1, make_searchable)
     return conn
@@ -76,16 +141,23 @@ def index():
             WHERE id NOT IN (SELECT DISTINCT movie_id FROM torrents)
         """).fetchone()[0]
         now_playing_count = conn.execute("SELECT COUNT(*) FROM now_playing").fetchone()[0]
+        try:
+            unmatched_count = conn.execute("SELECT COUNT(*) FROM unmatched_torrents").fetchone()[0]
+        except sqlite3.OperationalError:
+            # Таблица появляется при первом запуске парсера после обновления.
+            unmatched_count = 0
         conn.close()
     except sqlite3.OperationalError:
-        movies_count, torrents_count, movies_without_torrents, now_playing_count = 0, 0, 0, 0
+        movies_count, torrents_count, movies_without_torrents = 0, 0, 0
+        now_playing_count, unmatched_count = 0, 0
 
     return render_template(
-        'index.html', 
-        movies_count=movies_count, 
+        'index.html',
+        movies_count=movies_count,
         torrents_count=torrents_count,
         movies_without_torrents=movies_without_torrents,
-        now_playing_count=now_playing_count
+        now_playing_count=now_playing_count,
+        unmatched_count=unmatched_count
     )
 
 @app.route('/movies')
@@ -139,8 +211,10 @@ def movie_detail(movie_id):
         
     torrents = conn.execute("SELECT * FROM torrents WHERE movie_id = ? ORDER BY size_gb DESC", (movie_id,)).fetchall()
     conn.close()
-    
-    return render_template('movie_detail.html', movie=movie, torrents=torrents)
+
+    # dict, а не sqlite3.Row: карточка уходит в шаблон еще и через tojson,
+    # чтобы виджет подбора раздач знал, для какого фильма искать.
+    return render_template('movie_detail.html', movie=dict(movie), torrents=torrents)
 
 @app.route('/now_playing')
 def now_playing():
@@ -177,17 +251,202 @@ def now_playing():
         total_pages=total_pages
     )
 
-import os
-import json
-
-from flask import send_file
-
 @app.route('/movies.zip')
 def download_db():
     try:
         return send_file(os.path.join(DATA_DIR, 'movies.zip'), as_attachment=True)
     except FileNotFoundError:
         return abort(404)
+
+@app.route('/search')
+def search_page():
+    return render_template('search.html')
+
+
+def _get_tracker_clients():
+    """Лениво создает и переиспользует клиентов трекеров.
+
+    Клиенты живут между запросами: авторизация на Rutracker стоит запроса, а
+    сессия внутри клиента сама переустанавливается, когда истекает.
+    """
+    global tracker_clients
+    if tracker_clients is not None:
+        return tracker_clients
+
+    global tracker_errors
+    clients, problems = [], []
+
+    try:
+        from rutracker_client import RutrackerClient
+        rutracker = RutrackerClient()
+        if rutracker.login():
+            clients.append(rutracker)
+        else:
+            problems.append(
+                "Rutracker: вход не выполнен (подробности в логе). Скорее всего защита "
+                "Cloudflare — задайте RUTRACKER_COOKIES и RUTRACKER_USER_AGENT в .env."
+            )
+    except Exception as e:
+        logging.error(f"Поиск: клиент Rutracker недоступен: {e}")
+        problems.append(f"Rutracker: {e}")
+
+    try:
+        from nnmclub_client import NnmclubClient
+        clients.append(NnmclubClient())
+    except Exception as e:
+        logging.error(f"Поиск: клиент NNM-Club недоступен: {e}")
+        problems.append(f"NNM-Club: {e}")
+
+    tracker_clients, tracker_errors = clients, problems
+    return clients
+
+
+def _parser_is_running():
+    """Идет ли сейчас фоновый обход: во время него в трекеры лучше не ходить."""
+    return parser_process is not None and parser_process.poll() is None
+
+
+@app.route('/api/search/catalog', methods=['POST'])
+def api_search_catalog():
+    """Шаг 1: ищет карточку в локальном каталоге, при промахе — в TMDB."""
+    query = (request.json or {}).get('query', '').strip()
+    if not query:
+        return jsonify({"error": "Пустой запрос"}), 400
+
+    db = MovieDatabase(db_name=DB_NAME)
+    local = db.find_movies_by_title(query)
+    if local:
+        return jsonify({"source": "database", "candidates": local})
+
+    tmdb_client = TMDBClient()
+    if not tmdb_client.read_token and not tmdb_client.api_key:
+        return jsonify({"error": "Ключи TMDB не заданы в .env"}), 500
+
+    candidates = tmdb_client.search_candidates(query)
+    if not candidates:
+        return jsonify({"source": "tmdb", "candidates": []})
+    return jsonify({"source": "tmdb", "candidates": candidates})
+
+
+@app.route('/api/search/save_candidate', methods=['POST'])
+def api_save_candidate():
+    """Сохраняет выбранного кандидата TMDB в каталог и возвращает карточку."""
+    candidate = (request.json or {}).get('candidate')
+    if not candidate or 'id' not in candidate:
+        return jsonify({"error": "Кандидат не передан"}), 400
+
+    db = MovieDatabase(db_name=DB_NAME)
+    movie_id = save_tmdb_candidate(candidate, db, TMDBClient())
+    if not movie_id:
+        return jsonify({"error": "Не удалось получить карточку из TMDB"}), 502
+
+    return jsonify({"movie": db.get_movie(movie_id)})
+
+
+@app.route('/api/search/torrents', methods=['POST'])
+def api_search_torrents():
+    """Шаг 2: ищет раздачи на трекерах по названию выбранной карточки."""
+    payload = request.json or {}
+    movie_id = payload.get('movie_id')
+    query = (payload.get('query') or '').strip()
+
+    if not query:
+        return jsonify({"error": "Пустой поисковый запрос"}), 400
+
+    if _parser_is_running():
+        return jsonify({
+            "error": "Идет фоновый обход трекеров. Остановите его, чтобы не удваивать нагрузку на трекер."
+        }), 409
+
+    db = MovieDatabase(db_name=DB_NAME)
+    known = {(t['tracker'], t['topic_id']) for t in db.get_torrents_for_movie(movie_id)} if movie_id else set()
+
+    clients = _get_tracker_clients()
+    results, errors = [], list(tracker_errors)
+
+    if not clients:
+        return jsonify({"error": "Ни один трекер недоступен. " + " ".join(errors)}), 503
+
+    for client in clients:
+        try:
+            for item in client.search(query):
+                item['already_linked'] = (item['tracker'], item['topic_id']) in known
+                results.append(item)
+        except Exception as e:
+            logging.error(f"Поиск на {client.name} не удался: {e}")
+            errors.append(f"{client.name}: {e}")
+
+    results.sort(key=lambda r: (r.get('seeds') or 0), reverse=True)
+    return jsonify({"results": results, "errors": errors})
+
+
+@app.route('/api/search/attach', methods=['POST'])
+def api_attach_torrents():
+    """Шаг 3: привязывает отмеченные раздачи к карточке фильма."""
+    payload = request.json or {}
+    movie_id = payload.get('movie_id')
+    selected = payload.get('items') or []
+
+    if not movie_id:
+        return jsonify({"error": "Не выбран фильм"}), 400
+    if not selected:
+        return jsonify({"error": "Не отмечено ни одной раздачи"}), 400
+
+    db = MovieDatabase(db_name=DB_NAME)
+    if not db.get_movie(movie_id):
+        return jsonify({"error": "Карточка не найдена в каталоге"}), 404
+
+    clients = {client.name: client for client in _get_tracker_clients()}
+    added, skipped = 0, []
+
+    for item in selected:
+        tracker = item.get('tracker')
+        topic_id = item.get('topic_id')
+        if not tracker or not topic_id:
+            continue
+        if db.is_torrent_exists(tracker, topic_id):
+            skipped.append(f"{tracker}#{topic_id} уже в базе")
+            continue
+
+        # Magnet есть только на странице раздачи, поэтому качаем ее лишь для
+        # подтвержденных вручную позиций.
+        magnet = ''
+        client = clients.get(tracker)
+        if client and item.get('url'):
+            magnet = client.fetch_magnet(item['url'])
+
+        db.insert_torrent(
+            tracker=tracker,
+            topic_id=int(topic_id),
+            movie_id=int(movie_id),
+            topic_title=item.get('title', ''),
+            size_gb=float(item.get('size_gb') or 0),
+            quality='',
+            file_format='',
+            translation='',
+            magnet_link=magnet,
+            seeds=int(item.get('seeds') or 0),
+            leeches=int(item.get('leeches') or 0),
+        )
+        db.delete_unmatched(tracker, int(topic_id))
+        added += 1
+
+    logging.info(f"Ручная привязка: добавлено {added} раздач к фильму {movie_id}.")
+    return jsonify({
+        "added": added,
+        "skipped": skipped,
+        "torrents": db.get_torrents_for_movie(movie_id),
+    })
+
+
+@app.route('/api/publish', methods=['POST'])
+def api_publish():
+    """Запускает упаковку базы и выгрузку в Cloudflare R2 фоновым процессом."""
+    if _parser_is_running():
+        return jsonify({"error": "Парсер уже занят, дождитесь завершения"}), 409
+    start_parser_task('publish')
+    return jsonify({"status": "started"})
+
 
 @app.route('/api/status')
 def api_status():
@@ -204,12 +463,18 @@ def api_status():
         status['torrents_count'] = conn.execute("SELECT COUNT(*) FROM torrents").fetchone()[0]
         status['movies_without_torrents'] = conn.execute("SELECT COUNT(*) FROM movies WHERE id NOT IN (SELECT DISTINCT movie_id FROM torrents)").fetchone()[0]
         status['now_playing_count'] = conn.execute("SELECT COUNT(*) FROM now_playing").fetchone()[0]
+        try:
+            status['unmatched_count'] = conn.execute("SELECT COUNT(*) FROM unmatched_torrents").fetchone()[0]
+        except sqlite3.OperationalError:
+            # Таблица появляется при первом запуске парсера после обновления.
+            status['unmatched_count'] = 0
         conn.close()
     except:
         status['movies_count'] = 0
         status['torrents_count'] = 0
         status['movies_without_torrents'] = 0
         status['now_playing_count'] = 0
+        status['unmatched_count'] = 0
         
     # Считывание прогресса
     try:
@@ -307,5 +572,8 @@ def api_shutdown():
 
 if __name__ == '__main__':
     from waitress import serve
-    print("Запуск production-сервера Waitress на порту 5000...")
-    serve(app, host='0.0.0.0', port=5000, threads=4)
+    # Те же переменные читает run.py, чтобы два способа запуска не разошлись.
+    host = os.environ.get('WEB_HOST', '0.0.0.0')
+    port = int(os.environ.get('WEB_PORT', '5000'))
+    print(f"Запуск production-сервера Waitress на {host}:{port}...")
+    serve(app, host=host, port=port, threads=4)

@@ -1,3 +1,11 @@
+"""Схемы данных для извлечения через LLM.
+
+ВНИМАНИЕ: пока не подключено. llm_parser.py описывает нужный JSON прямо в
+системном промпте и разбирает ответ регулярным выражением, а имена полей здесь
+не совпадают с теми, что запрашивает промпт (title/ru_title, size/size_gb).
+Задействовать при переходе на structured output.
+"""
+
 from pydantic import BaseModel, Field
 from typing import Optional
 

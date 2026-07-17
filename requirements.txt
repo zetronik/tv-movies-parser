@@ -1,6 +1,7 @@
 flask
 apscheduler
 requests
+cloudscraper
 python-dotenv
 beautifulsoup4
 lxml
