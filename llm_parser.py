@@ -169,6 +169,15 @@ def _merge_link_lists(acc: dict, part: dict) -> dict:
 def _request_json(system_prompt: str, content: str) -> dict:
     """Делает один запрос к модели и возвращает разобранный JSON или пустой dict."""
     try:
+        # Предварительная очистка входящего контента перед отправкой в модель
+        optimized_content = _clean_markdown_links(user_content)
+
+        # Если после очистки контент остался слишком большим, принудительно его обрезаем
+        # (в среднем 1 токен ≈ 4 символа для английского, для русского — около 1.5-2 символов)
+        # Ограничим лимит в 10 000 символов (~2500-3000 токенов)
+        if len(optimized_content) > 12000:
+            optimized_content = optimized_content[:12000] + "\n... [Часть текста обрезана для экономии контекста] ..."
+
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
