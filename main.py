@@ -729,14 +729,14 @@ def main():
             if rutracker_cls:
                 rutracker = rutracker_cls()
                 try:
-                    authorized = rutracker.login()
+                    accessible = rutracker.login()
                 except Exception as e:
-                    logging.error(f"Ошибка авторизации на Rutracker: {e}")
-                    authorized = False
-                if authorized:
+                    logging.error(f"Ошибка проверки доступа к Rutracker: {e}")
+                    accessible = False
+                if accessible:
                     total_inserted += run_tracker_pipeline('rutracker', f"{rutracker.base_domain}/forum/index.php", rutracker, db, tmdb_client, flag_path)
                 else:
-                    logging.error("Не удалось авторизоваться на Rutracker.")
+                    logging.error("Rutracker недоступен (см. лог выше).")
 
         # 4. Запуск пайплайна NNM-Club
         if run_nnmclub and not os.path.exists(flag_path):

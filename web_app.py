@@ -266,8 +266,8 @@ def search_page():
 def _get_tracker_clients():
     """Лениво создает и переиспользует клиентов трекеров.
 
-    Клиенты живут между запросами: авторизация на Rutracker стоит запроса, а
-    сессия внутри клиента сама переустанавливается, когда истекает.
+    Клиенты живут между запросами: проверка доступности Rutracker стоит
+    запроса, а сессия внутри клиента сама переустанавливается, когда истекает.
     """
     global tracker_clients
     if tracker_clients is not None:
@@ -283,7 +283,7 @@ def _get_tracker_clients():
             clients.append(rutracker)
         else:
             problems.append(
-                "Rutracker: вход не выполнен (подробности в логе). Скорее всего защита "
+                "Rutracker: сайт недоступен (подробности в логе). Скорее всего защита "
                 "Cloudflare — задайте RUTRACKER_COOKIES и RUTRACKER_USER_AGENT в .env."
             )
     except Exception as e:
