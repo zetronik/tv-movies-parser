@@ -34,6 +34,22 @@ MIN_RESULT_TITLE_LENGTH = 5
 # Запасное правило отбора строк, когда сиды и размер распознать не удалось.
 MIN_RESULT_CELLS = 4
 
+# Сколько строк должно набраться по запасному правилу, чтобы им поверить.
+# На странице «ничего не найдено» под него попадают ссылки бокового меню
+# ("Правила", "Новости"), и одна такая строка выдавалась за раздачу.
+MIN_STRUCTURAL_FALLBACK_ROWS = 3
+
+# Штатный поиск phpBB отдает по 50 строк на страницу, остальные — по &start=N.
+# Раньше забиралась только первая страница, поэтому у популярных названий
+# половина раздач просто не доходила до панели.
+SEARCH_PAGE_SIZE = 50
+DEFAULT_SEARCH_PAGES = 4
+DEFAULT_SEARCH_LIMIT = 200
+
+# Год в конце запроса ("Silo 2023"): поиск трекера считает слова обязательными,
+# поэтому такой запрос отсекает раздачи, где год в названии другой.
+TRAILING_YEAR_PATTERN = re.compile(r'\s+(19|20)\d{2}\s*$')
+
 SIZE_IN_ROW_PATTERN = re.compile(
     r'(\d+(?:[.,]\d+)?)\s*(GB|MB|TB|KB|GiB|MiB|TiB|ГБ|МБ|ТБ|КБ)\b', re.IGNORECASE
 )
@@ -69,6 +85,36 @@ def env_float(name: str, default: float) -> float:
     except ValueError:
         logging.warning(f"Некорректное значение {name}={raw!r}, используется {default}.")
         return default
+
+
+def env_int(name: str, default: int) -> int:
+    """Читает целое число из переменной окружения.
+
+    Args:
+        name: Имя переменной окружения.
+        default: Значение, если переменная не задана или не разбирается.
+
+    Returns:
+        Значение переменной либо default.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning(f"Некорректное значение {name}={raw!r}, используется {default}.")
+        return default
+
+
+def strip_trailing_year(query: str) -> str:
+    """Убирает год в конце поискового запроса.
+
+    Returns:
+        Запрос без года либо пустую строку, если года не было.
+    """
+    stripped = TRAILING_YEAR_PATTERN.sub('', query).strip()
+    return stripped if stripped and stripped != query.strip() else ''
 
 
 class BaseTrackerClient:
@@ -227,26 +273,80 @@ class BaseTrackerClient:
 
     # --- Поиск раздач ---
 
-    def search(self, query, limit=50):
+    def search(self, query, limit=None):
         """Ищет раздачи по названию через штатный поиск трекера.
 
         Страница результатов разбирается детерминированно, без LLM: она
-        табличная, а результат нужен интерактивно, за секунды.
+        табличная, а результат нужен интерактивно, за секунды. Результаты
+        собираются с нескольких страниц выдачи, а если запрос с годом не дал
+        ничего, он повторяется без года.
 
         Args:
             query: Название для поиска.
-            limit: Максимальное число результатов.
+            limit: Максимальное число результатов (по умолчанию из окружения).
 
         Returns:
             Список словарей: topic_id, url, title, size_gb, seeds, leeches.
 
         Raises:
-            TrackerFetchError: Если страница поиска недоступна.
+            TrackerFetchError: Если первая страница поиска недоступна.
         """
-        search_url = f"{self.base_domain}{self.SEARCH_PATH}?nm={quote_plus(query)}"
-        logging.info(f"[{self.name}] Поиск: {query}")
-        html = self.fetch_page(search_url)
-        return self._parse_search_results(html, search_url, limit)
+        limit = limit or env_int('SEARCH_RESULT_LIMIT', DEFAULT_SEARCH_LIMIT)
+        results = self._search_pages(query, limit)
+
+        # Год в запросе сужает выдачу до раздач ровно этого года. Для сериалов
+        # (сезоны выходят годами) и для фильмов, у которых на трекере указан
+        # другой год, это дает пустой результат — тогда пробуем без года.
+        if not results:
+            without_year = strip_trailing_year(query)
+            if without_year:
+                logging.info(f"[{self.name}] Пусто по «{query}», повтор без года: «{without_year}»")
+                results = self._search_pages(without_year, limit)
+
+        logging.info(f"[{self.name}] Найдено результатов: {len(results)}")
+        return results
+
+    def _search_pages(self, query, limit):
+        """Обходит страницы выдачи поиска, пока они не кончатся или не хватит.
+
+        Следующая страница запрашивается только если предыдущая пришла
+        заполненной: лишний запрос к трекеру в интерактивном сценарии стоит
+        дороже пары недостающих строк.
+        """
+        max_pages = max(1, env_int('SEARCH_MAX_PAGES', DEFAULT_SEARCH_PAGES))
+        base_url = f"{self.base_domain}{self.SEARCH_PATH}?nm={quote_plus(query)}"
+        results, seen = [], set()
+
+        for page in range(max_pages):
+            page_url = base_url if page == 0 else f"{base_url}&start={page * SEARCH_PAGE_SIZE}"
+            logging.info(f"[{self.name}] Поиск: {query} (страница {page + 1})")
+            try:
+                html = self.fetch_page(page_url)
+            except TrackerFetchError:
+                # Обрыв на первой странице — это нерабочий поиск, дальше
+                # разбираться вызывающему. На последующих уже есть что показать.
+                if page == 0:
+                    raise
+                logging.warning(f"[{self.name}] Страница {page + 1} выдачи недоступна, берем что есть.")
+                break
+
+            page_items = self._parse_search_results(html, page_url, limit)
+            added = 0
+            for item in page_items:
+                if item['topic_id'] in seen:
+                    continue
+                seen.add(item['topic_id'])
+                results.append(item)
+                added += 1
+                if len(results) >= limit:
+                    return results
+
+            # Неполная страница — выдача кончилась; ноль новых строк означает,
+            # что трекер проигнорировал start и вернул то же самое.
+            if added == 0 or len(page_items) < SEARCH_PAGE_SIZE:
+                break
+
+        return results
 
     def _row_topic_link(self, row, page_url):
         """Возвращает первую ссылку на раздачу внутри строки таблицы."""
@@ -305,7 +405,10 @@ class BaseTrackerClient:
 
         rows = [c for c in candidates if c['has_signal']]
         if not rows:
-            rows = [c for c in candidates if len(c['row'].find_all('td')) >= MIN_RESULT_CELLS]
+            structural = [c for c in candidates if len(c['row'].find_all('td')) >= MIN_RESULT_CELLS]
+            # Одиночная строка по этому правилу — почти наверняка боковое меню,
+            # а не сломавшаяся разметка выдачи.
+            rows = structural if len(structural) >= MIN_STRUCTURAL_FALLBACK_ROWS else []
             if rows:
                 logging.warning(
                     f"[{self.name}] Показатели раздач не распознаны, "
@@ -323,7 +426,6 @@ class BaseTrackerClient:
             if len(results) >= limit:
                 break
 
-        logging.info(f"[{self.name}] Найдено результатов: {len(results)}")
         return results
 
     @staticmethod

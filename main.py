@@ -17,6 +17,7 @@ from tmdb_client import TMDBClient
 from content_cleaner import clean_html_to_markdown
 from tracker_client import env_float
 from catalog import TV_ID_OFFSET, save_tmdb_movie, save_tmdb_tv
+from export_db import build_public_db, public_export_enabled
 
 # Импортируем методы для работы с локальной LLM
 from llm_parser import (
@@ -28,6 +29,9 @@ from llm_parser import (
 
 DATA_DIR = 'data/'
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# Срез базы для клиентов: собирается перед упаковкой, рядом с рабочей базой.
+PUBLIC_DB_NAME = 'movies_public.db'
 
 logging.basicConfig(
     level=logging.INFO,
@@ -242,11 +246,25 @@ def create_zip(db_name="movies.db", db=None):
     if db is not None:
         db.checkpoint()
 
+    # Рабочая база остаётся полным каталогом, а в облако уезжает её срез —
+    # только карточки с раздачами. Если срез собрать не удалось, публикацию
+    # прерываем: выгрузить вместо него полный каталог хуже, чем не выгрузить
+    # ничего.
+    payload_db = db_name
+    if public_export_enabled():
+        update_progress("Подготовка публичной базы", 99, 100)
+        try:
+            payload_db = build_public_db(db_name, os.path.join(DATA_DIR, PUBLIC_DB_NAME))
+        except Exception as e:
+            logging.error(f"Не удалось собрать публичную базу: {e}. Публикация отменена.")
+            return
+
     try:
         temp_zip = os.path.join(DATA_DIR, "movies_temp.zip")
         final_zip = os.path.join(DATA_DIR, "movies.zip")
         with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(db_name, arcname=os.path.basename(db_name))
+            # Имя внутри архива всегда movies.db — клиентские приложения ждут его.
+            zipf.write(payload_db, arcname="movies.db")
 
         for _ in range(5):
             try:

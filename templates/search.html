@@ -16,7 +16,7 @@
         type="text"
         id="titleInput"
         class="form-control bg-dark text-light border-secondary"
-        placeholder="Название, например: Дюна"
+        placeholder="Название, например: Дюна или Мятеж 2026"
         onkeydown="if (event.key === 'Enter') searchCatalog()"
       />
       <button class="btn btn-primary" id="btnSearchCatalog" onclick="searchCatalog()">
@@ -48,7 +48,7 @@
   }
 
   // --- Шаг 1 ---
-  function searchCatalog() {
+  function searchCatalog(forceTmdb) {
     const query = document.getElementById("titleInput").value.trim();
     if (!query) return;
 
@@ -59,19 +59,33 @@
     fetch("/api/search/catalog", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: query }),
+      body: JSON.stringify({ query: query, force_tmdb: !!forceTmdb }),
     })
       .then((r) => r.json())
       .then((data) => {
         if (data.error) return note("catalogStatus", esc(data.error), "danger");
         if (!data.candidates.length)
-          return note("catalogStatus", "Ничего не найдено ни в базе, ни в TMDB.", "warning");
+          return note(
+            "catalogStatus",
+            forceTmdb
+              ? "В TMDB ничего не найдено по этому запросу."
+              : "Ничего не найдено ни в базе, ни в TMDB.",
+            "warning"
+          );
+
+        // Кнопка нужна, когда база вернула похожие, но не те карточки:
+        // иначе выдача из базы навсегда перекрывает поиск в TMDB.
+        const retry =
+          data.source === "database"
+            ? ' <button class="btn btn-sm btn-outline-info ms-2" onclick="searchCatalog(true)">' +
+              "Искать в TMDB</button>"
+            : "";
 
         note(
           "catalogStatus",
-          data.source === "database"
-            ? `Найдено в базе: ${data.candidates.length}. Выберите карточку.`
-            : `В базе нет. Найдено в TMDB: ${data.candidates.length}. Выберите карточку — она будет добавлена в базу.`
+          (data.source === "database"
+            ? `Найдено в базе: ${data.candidates.length}. Выберите карточку — или поищите в TMDB, если нужной нет.`
+            : `Найдено в TMDB: ${data.candidates.length}. Выберите карточку — она будет добавлена в базу.`) + retry
         );
         renderCandidates(data.candidates, data.source);
       })

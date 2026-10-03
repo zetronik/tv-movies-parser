@@ -9,6 +9,13 @@ db_lock = threading.Lock()
 # и единственная реальная защита от гонок — таймаут самого SQLite.
 DB_TIMEOUT_SECONDS = 30
 
+def _searchable(text):
+    """Приводит название к виду, пригодному для регистронезависимого сравнения."""
+    if not text:
+        return ""
+    return str(text).lower().replace('ё', 'е')
+
+
 class MovieDatabase:
     def __init__(self, db_name="data/movies.db"):
         self.db_name = db_name
@@ -212,11 +219,23 @@ class MovieDatabase:
             except sqlite3.OperationalError:
                 return set()
 
-    def find_movies_by_title(self, query, limit=10):
+    # Сколько строк вытаскиваем из базы, прежде чем ранжировать их в Python.
+    # LIKE '%...%' все равно идет полным сканом, так что запас почти бесплатен,
+    # а без него свежие карточки (rating 0) не попадали в выдачу вовсе.
+    TITLE_SEARCH_POOL = 300
+
+    def find_movies_by_title(self, query, year=None, limit=20):
         """Ищет карточки в локальном каталоге по части названия.
+
+        Сортировка по рейтингу не годится: у только что вышедших фильмов
+        rating = 0, и они оказывались ниже любого старого сериала с похожим
+        названием, а лимит их отрезал. Поэтому сначала точное совпадение,
+        потом совпадение с начала строки, и уже внутри группы — от новых к
+        старым.
 
         Args:
             query: Часть русского или оригинального названия.
+            year: Год выпуска, если указан в запросе. Отсекает все остальное.
             limit: Максимальное число результатов.
 
         Returns:
@@ -225,15 +244,42 @@ class MovieDatabase:
         sql = """
         SELECT id, title, original_title, release_date, poster_url, rating, media_type, overview
         FROM movies
-        WHERE title LIKE ? OR original_title LIKE ?
-        ORDER BY rating DESC
-        LIMIT ?
+        WHERE (searchable(title) LIKE ? OR searchable(original_title) LIKE ?)
         """
-        like = f"%{query}%"
+        needle = _searchable(query)
+        params = [f"%{needle}%", f"%{needle}%"]
+        if year:
+            sql += " AND release_date LIKE ?"
+            params.append(f"{year}-%")
+        sql += " LIMIT ?"
+        params.append(self.TITLE_SEARCH_POOL)
+
         with self.get_connection() as conn:
+            # LIKE в SQLite приводит регистр только для ASCII, поэтому "мятеж"
+            # не находил "Мятеж". Нормализуем обе стороны сами — тем же
+            # способом, что и список фильмов в панели.
+            conn.create_function("searchable", 1, _searchable)
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(sql, (like, like, limit)).fetchall()
-            return [dict(row) for row in rows]
+            rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+        def sort_key(row):
+            title = _searchable(row.get("title"))
+            original = _searchable(row.get("original_title"))
+            if needle in (title, original):
+                relevance = 0
+            elif title.startswith(needle) or original.startswith(needle):
+                relevance = 1
+            else:
+                relevance = 2
+            release_year = (row.get("release_date") or "")[:4]
+            return (
+                relevance,
+                -int(release_year) if release_year.isdigit() else 0,
+                -(row.get("rating") or 0),
+            )
+
+        rows.sort(key=sort_key)
+        return rows[:limit]
 
     def get_movie(self, movie_id):
         """Возвращает карточку каталога по id или None."""

@@ -4,6 +4,7 @@ import hmac
 import logging
 import math
 import os
+import re
 import sys
 import json
 import subprocess
@@ -15,6 +16,7 @@ from dotenv import load_dotenv
 from catalog import save_tmdb_candidate
 from database import MovieDatabase
 from tmdb_client import TMDBClient
+from tracker_client import DEFAULT_SEARCH_LIMIT, env_int
 
 load_dotenv()
 
@@ -306,25 +308,54 @@ def _parser_is_running():
     return parser_process is not None and parser_process.poll() is None
 
 
+# "Мятеж 2026", "Мятеж (2026)", "Мятеж [2026]" — год в конце запроса.
+YEAR_IN_QUERY_RE = re.compile(r'^(?P<title>.+?)[\s(\[]+(?P<year>(?:19|20)\d{2})[)\]\s]*$')
+
+
+def split_query_year(query):
+    """Отделяет год в конце запроса от названия.
+
+    Args:
+        query: Строка из поля ввода.
+
+    Returns:
+        Кортеж (название, год) — год строкой или None, если его нет.
+    """
+    match = YEAR_IN_QUERY_RE.match(query)
+    if not match:
+        return query, None
+    return match.group('title').strip(), match.group('year')
+
+
 @app.route('/api/search/catalog', methods=['POST'])
 def api_search_catalog():
     """Шаг 1: ищет карточку в локальном каталоге, при промахе — в TMDB."""
-    query = (request.json or {}).get('query', '').strip()
+    payload = request.json or {}
+    query = payload.get('query', '').strip()
+    # Оператор может принудительно спросить TMDB, если в базе нашлось не то:
+    # локальный каталог содержит миллионы карточек, и по общему слову вроде
+    # "Мятеж" он всегда что-нибудь возвращает, раньше намертво закрывая
+    # дорогу к TMDB.
+    force_tmdb = bool(payload.get('force_tmdb'))
     if not query:
         return jsonify({"error": "Пустой запрос"}), 400
 
-    db = MovieDatabase(db_name=DB_NAME)
-    local = db.find_movies_by_title(query)
-    if local:
-        return jsonify({"source": "database", "candidates": local})
+    title, year = split_query_year(query)
+
+    if not force_tmdb:
+        db = MovieDatabase(db_name=DB_NAME)
+        local = db.find_movies_by_title(title, year=year)
+        if local:
+            return jsonify({"source": "database", "candidates": local})
 
     tmdb_client = TMDBClient()
     if not tmdb_client.read_token and not tmdb_client.api_key:
         return jsonify({"error": "Ключи TMDB не заданы в .env"}), 500
 
-    candidates = tmdb_client.search_candidates(query)
-    if not candidates:
-        return jsonify({"source": "tmdb", "candidates": []})
+    candidates = tmdb_client.search_candidates(title, year=year)
+    if not candidates and year:
+        # Год мог относиться к релизу на трекере, а не к дате TMDB.
+        candidates = tmdb_client.search_candidates(title)
     return jsonify({"source": "tmdb", "candidates": candidates})
 
 
@@ -367,11 +398,18 @@ def api_search_torrents():
     if not clients:
         return jsonify({"error": "Ни один трекер недоступен. " + " ".join(errors)}), 503
 
+    limit = env_int('SEARCH_RESULT_LIMIT', DEFAULT_SEARCH_LIMIT)
     for client in clients:
         try:
-            for item in client.search(query):
+            found = client.search(query, limit)
+            for item in found:
                 item['already_linked'] = (item['tracker'], item['topic_id']) in known
                 results.append(item)
+            # Выдача уперлась в потолок — раздач на трекере больше, чем показано.
+            if len(found) >= limit:
+                errors.append(
+                    f"{client.name}: показаны первые {limit} раздач, уточните запрос."
+                )
         except Exception as e:
             logging.error(f"Поиск на {client.name} не удался: {e}")
             errors.append(f"{client.name}: {e}")

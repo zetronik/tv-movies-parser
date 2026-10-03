@@ -9,6 +9,8 @@
  * где movie — объект карточки с полями id, title, original_title, release_date.
  */
 const TorrentPicker = {
+  // Сдвиг идентификаторов сериалов в каталоге (см. TV_ID_OFFSET в catalog.py).
+  TV_ID_OFFSET: 100000000,
   container: null,
   movie: null,
   results: [],
@@ -22,7 +24,12 @@ const TorrentPicker = {
 
     const title = movie.original_title || movie.title || "";
     const year = (movie.release_date || "").slice(0, 4);
-    const query = year ? `${title} ${year}` : title;
+    // У сериала год карточки — это год первого сезона, и поиск на трекере с
+    // ним отсекает все остальные сезоны. Для фильмов год, наоборот, отсеивает
+    // однофамильцев; если он не совпадет с трекером, клиент повторит запрос
+    // без года сам.
+    const isSeries = movie.media_type === "tv" || Number(movie.id) >= TorrentPicker.TV_ID_OFFSET;
+    const query = year && !isSeries ? `${title} ${year}` : title;
 
     this.container.innerHTML = `
       <div class="card shadow-sm mb-4">
